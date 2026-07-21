@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ProductPriceSync - Dashboard</title>
+    <link rel="stylesheet" href="/ProductSync/static/css/dashboard.css">
+</head>
+<body>
+    <header class="header">
+        <h1>ProductPriceSync Service</h1>
+        <div class="header-actions">
+            <label class="api-key-control" for="apiKeyInput">
+                <span>API key</span>
+                <input type="password" id="apiKeyInput" autocomplete="off" placeholder="Operator or viewer key">
+            </label>
+            <button class="btn btn-sm btn-primary" id="btnConnectApi" type="button">Connect</button>
+            <span class="auth-status" id="authStatus">Not authenticated</span>
+            <span class="uptime" id="uptime">Connecting...</span>
+        </div>
+    </header>
+
+    <main class="container">
+        <section class="cards" aria-label="Synchronization status">
+            <div class="card"><div class="label">Service State</div><div class="value" id="syncState">--</div><div class="sub" id="syncTrigger"></div></div>
+            <div class="card"><div class="label">Total Outlets</div><div class="value" id="totalOutlets">0</div><div class="sub" id="inProgress"></div></div>
+            <div class="card"><div class="label">Successful</div><div class="value status-success" id="successCount">0</div></div>
+            <div class="card"><div class="label">Failed</div><div class="value status-failed" id="failedCount">0</div></div>
+            <div class="card"><div class="label">Retry Queue</div><div class="value" id="retryCount">0</div></div>
+            <div class="card"><div class="label">Last Run</div><div class="value" id="lastRun">--</div><div class="sub" id="lastRunTrigger"></div></div>
+            <div class="card"><div class="label">Next Run</div><div class="value" id="nextRunCountdown">--</div><div class="sub" id="nextRunTime"></div></div>
+            <div class="card"><div class="label">Total Cycles</div><div class="value" id="totalCycles">0</div></div>
+        </section>
+
+        <section id="progressSection" class="progress-section" hidden>
+            <div class="progress-bar"><div class="progress-fill progress-success" id="progressFill"></div></div>
+            <div class="progress-text" id="progressText"></div>
+        </section>
+
+        <section class="controls" aria-label="Service controls">
+            <button class="btn btn-primary" id="btnStartSync" type="button">Start Full Sync</button>
+            <button class="btn btn-danger" id="btnStopSync" type="button" disabled>Stop Current Sync</button>
+            <button class="btn btn-warning" id="btnPauseSchedule" type="button">Pause Schedule</button>
+            <button class="btn btn-primary" id="btnResumeSchedule" type="button" hidden>Resume Schedule</button>
+            <button class="btn btn-warning" id="btnRetryAll" type="button">Retry Failed</button>
+            <button class="btn btn-danger" id="btnClearRetries" type="button">Clear Retry Queue</button>
+        </section>
+
+        <section class="single-outlet-panel" aria-labelledby="singleOutletTitle">
+            <div class="single-outlet-heading">
+                <div>
+                    <h3 id="singleOutletTitle">Single Outlet Sync</h3>
+                    <p>Test Product, ProductPrice, and ProductBarCode synchronization on one outlet before enabling bulk sync.</p>
+                </div>
+                <span class="database-write-badge">Real database sync</span>
+            </div>
+            <div class="single-outlet-controls">
+                <div class="form-group single-outlet-code-group">
+                    <label for="singleOutletCode">Outlet code</label>
+                    <input id="singleOutletCode" type="text" maxlength="20" autocomplete="off" placeholder="e.g. F001">
+                </div>
+                <button class="btn btn-primary" id="btnSyncSingleOutlet" type="button">Sync Single Outlet</button>
+            </div>
+            <p class="single-outlet-warning">Pause the schedule before production testing. This operation writes real data to the selected outlet database.</p>
+            <div class="single-outlet-result" id="singleOutletResult" role="status" aria-live="polite"></div>
+        </section>
+
+        <section class="schedule-panel">
+            <h3>Schedule Configuration <span class="current-schedule" id="scheduleDescription">Loading...</span></h3>
+            <div class="schedule-tabs" role="tablist">
+                <button class="schedule-tab active" data-mode="visual" type="button">Visual</button>
+                <button class="schedule-tab" data-mode="daywise" type="button">Day-wise</button>
+                <button class="schedule-tab" data-mode="cron" type="button">Advanced (Cron)</button>
+            </div>
+            <div class="schedule-form active" id="scheduleVisual">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="scheduleInterval">Run every</label>
+                        <select id="scheduleInterval">
+                            <option value="5">5 min</option><option value="10">10 min</option>
+                            <option value="15">15 min</option><option value="20">20 min</option>
+                            <option value="25">25 min</option><option value="30" selected>30 min</option>
+                            <option value="35">35 min</option><option value="40">40 min</option>
+                            <option value="45">45 min</option><option value="50">50 min</option>
+                            <option value="55">55 min</option><option value="60">1 hour</option>
+                            <option value="75">1.25 hour</option><option value="120">2 hour</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="activeHoursStart">Active from</label>
+                        <select id="activeHoursStart">
+                            <option value="0:00" selected>12:00 AM</option><option value="0:30">12:30 AM</option>
+                            <option value="1:00">1:00 AM</option><option value="1:30">1:30 AM</option>
+                            <option value="2:00">2:00 AM</option><option value="2:30">2:30 AM</option>
+                            <option value="3:00">3:00 AM</option><option value="3:30">3:30 AM</option>
+                            <option value="4:00">4:00 AM</option><option value="4:30">4:30 AM</option>
+                            <option value="5:00">5:00 AM</option><option value="5:30">5:30 AM</option>
+                            <option value="6:00">6:00 AM</option><option value="6:30">6:30 AM</option>
+                            <option value="7:00">7:00 AM</option><option value="7:30">7:30 AM</option>
+                            <option value="8:00">8:00 AM</option><option value="8:30">8:30 AM</option>
+                            <option value="9:00">9:00 AM</option><option value="9:30">9:30 AM</option>
+                            <option value="10:00">10:00 AM</option><option value="10:30">10:30 AM</option>
+                            <option value="11:00">11:00 AM</option><option value="11:30">11:30 AM</option>
+                            <option value="12:00">12:00 PM</option><option value="12:30">12:30 PM</option>
+                            <option value="13:00">1:00 PM</option><option value="13:30">1:30 PM</option>
+                            <option value="14:00">2:00 PM</option><option value="14:30">2:30 PM</option>
+                            <option value="15:00">3:00 PM</option><option value="15:30">3:30 PM</option>
+                            <option value="16:00">4:00 PM</option><option value="16:30">4:30 PM</option>
+                            <option value="17:00">5:00 PM</option><option value="17:30">5:30 PM</option>
+                            <option value="18:00">6:00 PM</option><option value="18:30">6:30 PM</option>
+                            <option value="19:00">7:00 PM</option><option value="19:30">7:30 PM</option>
+                            <option value="20:00">8:00 PM</option><option value="20:30">8:30 PM</option>
+                            <option value="21:00">9:00 PM</option><option value="21:30">9:30 PM</option>
+                            <option value="22:00">10:00 PM</option><option value="22:30">10:30 PM</option>
+                            <option value="23:00">11:00 PM</option><option value="23:30">11:30 PM</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="activeHoursEnd">Active until</label>
+                        <select id="activeHoursEnd">
+                            <option value="0:00">12:00 AM</option><option value="0:30">12:30 AM</option>
+                            <option value="1:00">1:00 AM</option><option value="1:30">1:30 AM</option>
+                            <option value="2:00">2:00 AM</option><option value="2:30">2:30 AM</option>
+                            <option value="3:00">3:00 AM</option><option value="3:30">3:30 AM</option>
+                            <option value="4:00">4:00 AM</option><option value="4:30">4:30 AM</option>
+                            <option value="5:00">5:00 AM</option><option value="5:30">5:30 AM</option>
+                            <option value="6:00">6:00 AM</option><option value="6:30">6:30 AM</option>
+                            <option value="7:00">7:00 AM</option><option value="7:30">7:30 AM</option>
+                            <option value="8:00">8:00 AM</option><option value="8:30">8:30 AM</option>
+                            <option value="9:00">9:00 AM</option><option value="9:30">9:30 AM</option>
+                            <option value="10:00">10:00 AM</option><option value="10:30">10:30 AM</option>
+                            <option value="11:00">11:00 AM</option><option value="11:30">11:30 AM</option>
+                            <option value="12:00">12:00 PM</option><option value="12:30">12:30 PM</option>
+                            <option value="13:00">1:00 PM</option><option value="13:30">1:30 PM</option>
+                            <option value="14:00">2:00 PM</option><option value="14:30">2:30 PM</option>
+                            <option value="15:00">3:00 PM</option><option value="15:30">3:30 PM</option>
+                            <option value="16:00">4:00 PM</option><option value="16:30">4:30 PM</option>
+                            <option value="17:00">5:00 PM</option><option value="17:30">5:30 PM</option>
+                            <option value="18:00">6:00 PM</option><option value="18:30">6:30 PM</option>
+                            <option value="19:00">7:00 PM</option><option value="19:30">7:30 PM</option>
+                            <option value="20:00">8:00 PM</option><option value="20:30">8:30 PM</option>
+                            <option value="21:00">9:00 PM</option><option value="21:30">9:30 PM</option>
+                            <option value="22:00">10:00 PM</option><option value="22:30">10:30 PM</option>
+                            <option value="23:00" selected>11:00 PM</option><option value="23:30">11:30 PM</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group days-group">
+                    <label>Active days</label>
+                    <div class="days-checkboxes" aria-label="Active days">
+                        <button class="day-check active" data-day="mon" type="button">Mon</button>
+                        <button class="day-check active" data-day="tue" type="button">Tue</button>
+                        <button class="day-check active" data-day="wed" type="button">Wed</button>
+                        <button class="day-check active" data-day="thu" type="button">Thu</button>
+                        <button class="day-check active" data-day="fri" type="button">Fri</button>
+                        <button class="day-check active" data-day="sat" type="button">Sat</button>
+                        <button class="day-check active" data-day="sun" type="button">Sun</button>
+                    </div>
+                </div>
+                <div class="schedule-apply-row">
+                    <button class="btn btn-primary" id="btnApplyVisual" type="button">Apply Schedule</button>
+                    <span class="schedule-status" id="visualStatus"></span>
+                </div>
+            </div>
+            <div class="schedule-form" id="scheduleDaywise">
+                <p class="daywise-help">Enable each required day and assign its own interval and active time window. Overnight windows end on the following day.</p>
+                <div class="daywise-grid" id="daywiseRules"></div>
+                <div class="schedule-apply-row">
+                    <button class="btn btn-primary" id="btnApplyDaywise" type="button">Apply Day-wise Schedule</button>
+                    <span class="schedule-status" id="daywiseStatus"></span>
+                </div>
+            </div>
+            <div class="schedule-form" id="scheduleCron">
+                <div class="form-group">
+                    <label for="cronExpression">Cron expression</label>
+                    <input id="cronExpression" type="text" placeholder="*/30 6-22 * * mon-fri">
+                </div>
+                <button class="btn btn-primary" id="btnApplyCron" type="button">Apply Cron Schedule</button>
+                <span class="schedule-status" id="cronStatus"></span>
+            </div>
+        </section>
+
+        <section class="section">
+            <div class="section-header">
+                <h2>Outlet Results</h2>
+                <div class="search-wrap">
+                    <input id="outletSearch" type="search" placeholder="Search by code or IP">
+                    <button class="search-clear" id="outletSearchClear" type="button" aria-label="Clear search">×</button>
+                    <span id="searchCount"></span><span class="badge" id="resultsBadge">0 outlets</span>
+                </div>
+            </div>
+            <div class="table-scroll"><table><thead><tr><th>Outlet</th><th>Server</th><th>Status</th><th>Duration</th><th>Remarks</th><th>Time</th><th>Action</th></tr></thead><tbody id="outletsTableBody"></tbody></table></div>
+        </section>
+
+        <section class="section">
+            <div class="section-header"><h2>Retry Queue</h2><span class="badge" id="retryBadge">0 entries</span></div>
+            <div class="table-scroll"><table><thead><tr><th>Outlet</th><th>Server</th><th>Attempt</th><th>Next Retry</th><th>Last Error</th></tr></thead><tbody id="retryTableBody"></tbody></table></div>
+        </section>
+
+        <section class="section">
+            <div class="section-header">
+                <h2>Live Log Feed</h2>
+                <div class="inline-controls"><span id="liveLogStatus">● API key required</span><button class="btn btn-sm btn-primary" id="btnReconnectLogs" type="button">Reconnect</button><button class="btn btn-sm" id="btnClearLogs" type="button">Clear</button></div>
+            </div>
+            <pre class="log-viewer" id="liveLogViewer">Enter an API key to connect.</pre>
+        </section>
+
+        <section class="section">
+            <div class="section-header">
+                <h2>Archived Logs</h2>
+                <div class="inline-controls"><input type="date" id="logDatePicker"><button class="btn btn-sm btn-primary" id="btnLoadLogs" type="button">Load</button></div>
+            </div>
+            <pre class="log-viewer" id="logViewer">Enter an API key to load protected logs.</pre>
+        </section>
+
+        <section class="section" id="priceChangeSection">
+            <div class="section-header">
+                <h2>Price Change History</h2>
+                <div class="inline-controls">
+                    <input type="search" id="priceOutletFilter" placeholder="Outlet code">
+                    <select id="priceDaysFilter"><option value="1">Last 24h</option><option value="3">Last 3 days</option><option value="7" selected>Last 7 days</option><option value="14">Last 14 days</option><option value="30">Last 30 days</option></select>
+                    <button class="btn btn-sm btn-primary" id="btnRefreshPriceChanges" type="button">Refresh</button>
+                    <span class="badge" id="priceChangeBadge">0 changes</span>
+                </div>
+            </div>
+            <div class="table-scroll"><table><thead><tr><th>Type</th><th>Run ID</th><th>Product</th><th>Depot</th><th>Previous</th><th>Current</th><th>Changed By</th><th>Previous Date</th><th>Current Date</th><th>Occurrence</th><th>Outlet</th></tr></thead><tbody id="priceChangesBody"></tbody></table></div>
+        </section>
+
+        <section class="cleanup-panel">
+            <button class="cleanup-header" type="button"><span>Price Change Cleanup</span><span class="toggle-icon" id="cleanupToggleIcon">▼</span></button>
+            <div class="cleanup-body" id="cleanupBody">
+                <div class="form-row">
+                    <div class="form-group"><label for="cleanupRetention">Retention days</label><input type="number" id="cleanupRetention" value="90" min="1" max="3650"></div>
+                    <div class="form-group"><label for="cleanupBatchSize">Batch size</label><input type="number" id="cleanupBatchSize" value="5000" min="1" max="100000"></div>
+                    <button class="btn btn-warning" id="btnTriggerCleanup" type="button">Trigger Cleanup</button>
+                </div>
+                <div class="cleanup-result" id="cleanupResult" aria-live="polite"></div>
+            </div>
+        </section>
+    </main>
+
+    <div class="confirmation-modal" id="singleOutletConfirmModal" role="dialog" aria-modal="true" aria-labelledby="singleOutletConfirmTitle" aria-describedby="singleOutletConfirmMessage" hidden>
+        <div class="confirmation-dialog">
+            <div class="confirmation-icon" aria-hidden="true">!</div>
+            <h2 id="singleOutletConfirmTitle">Confirm Single Outlet Sync</h2>
+            <p id="singleOutletConfirmMessage"></p>
+            <div class="confirmation-actions">
+                <button class="btn btn-primary" id="btnConfirmSingleOutlet" type="button">Confirm</button>
+                <button class="btn btn-danger" id="btnCancelSingleOutlet" type="button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="confirmation-modal" id="scheduleConfirmModal" role="dialog" aria-modal="true" aria-labelledby="scheduleConfirmTitle" aria-describedby="scheduleConfirmMessage" hidden>
+        <div class="confirmation-dialog">
+            <div class="confirmation-icon" aria-hidden="true">!</div>
+            <h2 id="scheduleConfirmTitle">Confirm Schedule Change</h2>
+            <p id="scheduleConfirmMessage"></p>
+            <div class="confirmation-actions">
+                <button class="btn btn-primary" id="btnConfirmScheduleAction" type="button">Confirm</button>
+                <button class="btn btn-danger" id="btnCancelScheduleAction" type="button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="confirmation-modal" id="fullSyncConfirmModal" role="dialog" aria-modal="true" aria-labelledby="fullSyncConfirmTitle" aria-describedby="fullSyncConfirmMessage" hidden>
+        <div class="confirmation-dialog">
+            <div class="confirmation-icon" aria-hidden="true">!</div>
+            <h2 id="fullSyncConfirmTitle">Start Full Sync</h2>
+            <p id="fullSyncConfirmMessage">Start a manual full synchronization now? Product, ProductPrice, and ProductBarCode data will be written to all eligible outlet databases.</p>
+            <div class="confirmation-actions">
+                <button class="btn btn-primary" id="btnConfirmFullSync" type="button">Start Full Sync</button>
+                <button class="btn btn-danger" id="btnCancelFullSync" type="button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="confirmation-modal" id="stopSyncConfirmModal" role="dialog" aria-modal="true" aria-labelledby="stopSyncConfirmTitle" aria-describedby="stopSyncConfirmMessage" hidden>
+        <div class="confirmation-dialog">
+            <div class="confirmation-icon" aria-hidden="true">!</div>
+            <h2 id="stopSyncConfirmTitle">Stop Current Sync</h2>
+            <p id="stopSyncConfirmMessage">Request a graceful stop for the current full-sync cycle? Waiting outlets will be cancelled, while active database operations will finish draining safely.</p>
+            <div class="confirmation-actions">
+                <button class="btn btn-primary" id="btnConfirmStopSync" type="button">Stop Current Sync</button>
+                <button class="btn btn-danger" id="btnCancelStopSync" type="button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="confirmation-modal" id="retryConfirmModal" role="dialog" aria-modal="true" aria-labelledby="retryConfirmTitle" aria-describedby="retryConfirmMessage" hidden>
+        <div class="confirmation-dialog">
+            <div class="confirmation-icon" aria-hidden="true">!</div>
+            <h2 id="retryConfirmTitle">Confirm Retry Action</h2>
+            <p id="retryConfirmMessage"></p>
+            <div class="confirmation-actions">
+                <button class="btn btn-primary" id="btnConfirmRetryAction" type="button">Confirm</button>
+                <button class="btn btn-danger" id="btnCancelRetryAction" type="button">Cancel</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+    <script type="module" src="/ProductSync/static/js/app.js"></script>
+</body>
+</html>

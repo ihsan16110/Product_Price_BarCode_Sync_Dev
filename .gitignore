@@ -1,0 +1,51 @@
+# Production-grade Gitignore for CustomerInfoSync Service
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Environment variables (Sensitive)
+.env
+.env.local
+.env.*.local
+.venv
+venv/
+ENV/
+env.bak
+env.lock
+
+# Logs and databases
+*.log
+logs/
+data/
+sync_log.txt
+*.sqlite3
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Project specific
+"CustomerInfoUpdate v9 1-14-26.py"
+RunSync.bat
+start-service.bat

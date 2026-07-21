@@ -1,0 +1,213 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "30-Way Outlet Sync Concurrency Audit",
+    "description": "Static technical feasibility and risk assessment for raising outlet synchronization concurrency from 10 to 30.",
+    "generatedAt": "2026-07-19T00:00:00+06:00",
+    "cards": [],
+    "charts": [
+      {
+        "id": "ideal_duration_chart",
+        "title": "Idealized cycle duration by concurrency",
+        "subtitle": "Minutes calculated from a 120-minute baseline at 10 workers, assuming perfect linear scaling.",
+        "headerMarkdown": "Use these bars as **planning lower bounds**, not measured forecasts. Shared-resource contention can increase actual duration.",
+        "type": "bar",
+        "dataset": "scenarios",
+        "sourceId": "model_calculation",
+        "encodings": {
+          "x": { "field": "concurrency", "type": "ordinal", "label": "Concurrent outlets" },
+          "y": { "field": "ideal_minutes", "type": "quantitative", "label": "Ideal duration (minutes)", "format": "number" },
+          "tooltip": [
+            { "field": "waves", "type": "quantitative", "label": "Approx. waves", "format": "number" }
+          ]
+        },
+        "yAxisTitle": "Ideal duration (minutes)",
+        "valueFormat": "number",
+        "layout": "full"
+      }
+    ],
+    "tables": [
+      {
+        "id": "risk_register",
+        "title": "Concurrency risk register",
+        "subtitle": "Static findings ranked by production impact; runtime capacity remains unmeasured.",
+        "dataset": "risks",
+        "sourceId": "audit_evidence",
+        "defaultSort": { "field": "rank", "direction": "asc" },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          { "field": "rank", "label": "Rank", "type": "number" },
+          { "field": "severity", "label": "Severity", "type": "text" },
+          { "field": "finding", "label": "Finding", "type": "text" },
+          { "field": "impact", "label": "Why it matters", "type": "text" },
+          { "field": "control", "label": "Required control", "type": "text" }
+        ]
+      },
+      {
+        "id": "ideal_scenarios",
+        "title": "Idealized duration scenarios",
+        "subtitle": "Planning lower bounds from a 120-minute baseline at 10 workers; not load-test forecasts.",
+        "dataset": "scenarios",
+        "sourceId": "model_calculation",
+        "defaultSort": { "field": "concurrency", "direction": "asc" },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          { "field": "concurrency", "label": "Concurrent outlets", "type": "number" },
+          { "field": "waves", "label": "Approx. waves", "type": "number" },
+          { "field": "ideal_minutes", "label": "Ideal duration (min)", "type": "number" },
+          { "field": "interpretation", "label": "Interpretation", "type": "text" }
+        ]
+      },
+      {
+        "id": "rollout_gates",
+        "title": "Production rollout gates",
+        "subtitle": "Every gate must pass before the next concurrency stage.",
+        "dataset": "gates",
+        "sourceId": "audit_evidence",
+        "defaultSort": { "field": "order", "direction": "asc" },
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          { "field": "order", "label": "Order", "type": "number" },
+          { "field": "gate", "label": "Gate", "type": "text" },
+          { "field": "pass_condition", "label": "Pass condition", "type": "text" },
+          { "field": "rollback", "label": "Rollback trigger", "type": "text" }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "audit_evidence",
+        "label": "Concurrency audit evidence and calculations",
+        "path": "docs/CONCURRENCY_30_AUDIT_EVIDENCE.md"
+      },
+      {
+        "id": "model_calculation",
+        "label": "Idealized concurrency scenario calculation",
+        "path": "docs/CONCURRENCY_30_AUDIT_EVIDENCE.md"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# 30-Way Outlet Sync Concurrency Audit"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "sourceId": "audit_evidence",
+        "body": "## Conditional go: feasible in code, not yet certified for production\n\n**Raising concurrency from 10 to 30 is technically permitted and there is no cross-outlet sequencing dependency that requires the current limit of 10.** Each outlet has its own database connection and same-outlet operations are serialized.\n\n**Do not change production directly from 10 to 30.** Thirty workers multiply simultaneous reads against the same Head Office database and create completion bursts against one log database. The application also relies on Python's default thread executor and can temporarily exceed its configured limit when timed-out ODBC work continues draining.\n\n**Recommended decision:** approve a controlled 10 → 15 → 20 → 25 → 30 rollout, but promote each stage only after database, network, timeout, failure, and audit-integrity gates pass. The ideal arithmetic suggests about 41 minutes at 30, but that is a lower bound, not a reliable forecast."
+      },
+      {
+        "id": "key_findings_heading",
+        "type": "markdown",
+        "body": "## Shared Head Office load is the principal barrier\n\nThe work is independent at the outlet level, but not at the infrastructure level. Every concurrent outlet reads the full Product and ProductBarcode datasets from Head Office through linked servers; ProductPrice is filtered by outlet and recency. The risk register below shows the controls needed before 30 can be considered safe."
+      },
+      { "id": "risk_table", "type": "table", "tableId": "risk_register", "layout": "full" },
+      {
+        "id": "duration_heading",
+        "type": "markdown",
+        "sourceId": "audit_evidence",
+        "body": "## Linear scaling would reduce two hours to roughly 41 minutes\n\nThe scenario table divides the operator-provided 120-minute baseline by the concurrency increase. Read these values as best-case planning bounds. If Head Office I/O, linked-server sessions, network bandwidth, outlet locks, or log writes saturate, the curve will flatten and failure rates may rise."
+      },
+      { "id": "scenario_chart", "type": "chart", "chartId": "ideal_duration_chart", "layout": "full" },
+      { "id": "scenario_table", "type": "table", "tableId": "ideal_scenarios", "layout": "full" },
+      {
+        "id": "scope_definitions",
+        "type": "markdown",
+        "body": "## Scope and definitions\n\n**Concurrency** means the maximum number of outlet operations admitted by the process-wide semaphore. It does not guarantee that only that many database operations exist, because an operation that crosses the asynchronous watchdog may keep running in a worker thread after its semaphore slot is released.\n\n**Full sync** means the single outlet-local transaction that inserts/updates Product, ProductPrice, and ProductBarcode, followed by separate centralized audit/status writes.\n\nThis assessment covers the current repository at revision `ec623d6`, its checked-in configuration, SQL shape, scheduling, retries, audit logging, and tests. It does not include production SQL Server telemetry, network measurements, execution plans, row counts, or index inventories."
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "body": "## Method: dependency tracing plus capacity-risk analysis\n\nThe audit traced the concurrency value from configuration into task dispatch, semaphore admission, per-outlet locking, ODBC execution, transaction commit, audit logging, retries, timeouts, and scheduler overlap prevention. It then identified resources shared across otherwise independent outlets and calculated ideal wave-based durations from the stated operating baseline.\n\nThe conclusion is descriptive and architectural. It establishes that 30 is code-feasible and identifies likely bottlenecks; it does not establish that current Head Office, network, log server, or outlet hardware has enough capacity."
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "sourceId": "audit_evidence",
+        "body": "## Three uncertainties prevent an unconditional approval\n\n1. **Runtime capacity is unknown.** No Head Office CPU, storage latency, network throughput, linked-server wait, log-write latency, or execution-plan evidence was available.\n2. **The two-hour observation conflicts with the checked-in watchdog.** The repository defaults to a 3,600-second full-cycle timeout, so a continuous two-hour cycle implies a deployment override, different build, or a measurement that includes retries or multiple runs.\n3. **Regression execution was unavailable.** Static test coverage was inspected, but tests could not run because the workspace has no functional Python runtime and Docker is not running.\n\nA load test that only measures total duration is insufficient. It must also confirm zero audit count mismatches, no increase in deadlocks/timeouts, bounded drain count, and acceptable Head Office/log-database headroom."
+      },
+      {
+        "id": "recommendation_heading",
+        "type": "markdown",
+        "body": "## Use staged promotion with automatic rollback\n\nRun one representative full cycle at each stage during a controlled window. Keep the same outlet population and source-change volume where possible, capture the required metrics, and compare every stage with the 10-worker baseline. Do not promote on duration alone."
+      },
+      { "id": "gates_table", "type": "table", "tableId": "rollout_gates", "layout": "full" },
+      {
+        "id": "engineering_actions",
+        "type": "markdown",
+        "body": "## Engineering actions before attempting 30\n\n- Explicitly configure a dedicated ODBC `ThreadPoolExecutor` above the target concurrency with headroom for log and health work; do not depend on the interpreter default.\n- Prevent timed-out draining operations from freeing effective capacity, or add a second limiter that counts running ODBC workers until they truly exit.\n- Reconcile the deployed `FULL_SYNC_TIMEOUT` with the observed cycle duration and set it above the accepted p99 cycle time; keep `OUTLET_SYNC_TIMEOUT` above `QUERY_TIMEOUT`.\n- Pre-create and migrate audit tables/indexes at startup only; remove repeated DDL/schema checks from each outlet's logging path.\n- Batch ProductPrice audit inserts instead of executing an insert and verification query for every changed row.\n- Capture Head Office query plans and verify useful indexes for ProductPrice date/depot access and outlet-side Product, ProductPrice, ProductBarcode, and ProductVfmg joins.\n- Consider snapshotting Product and ProductBarcode once per cycle to avoid 30 identical full-table Head Office reads per wave. This is the highest-value architectural optimization if Head Office saturates."
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## Evidence still needed for final certification\n\n- What `FULL_SYNC_TIMEOUT` is actually deployed, and how is the two-hour duration measured?\n- At concurrency 10, what are outlet-duration p50/p95/p99, query-timeout rate, failure rate, retry count, and maximum draining-operation count?\n- During the current run, what are Head Office CPU, disk read latency, network throughput, active linked-server sessions, waits, blocking, and deadlocks?\n- How many Product and ProductBarcode rows are transferred per outlet, and are those tables changing often enough to justify full copies?\n- What is the log database's p95 write latency and audit row volume per cycle?\n- Are the required join keys indexed consistently across all outlet databases?"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-07-19T00:00:00+06:00",
+    "status": "ready",
+    "datasets": {
+      "risks": [
+        { "rank": 1, "severity": "Critical", "finding": "Thirty workers issue simultaneous full Product and ProductBarcode reads against the same Head Office source.", "impact": "Central CPU, I/O, network, or linked-server capacity can saturate; scaling may flatten and timeouts may rise.", "control": "Stage-load test with Head Office waits/CPU/I/O/network telemetry; rollback on material saturation." },
+        { "rank": 2, "severity": "High", "finding": "Timed-out shielded ODBC work can continue after the semaphore slot is released.", "impact": "Actual running database work can exceed 30 and create a retry/timeout amplification loop.", "control": "Count draining ODBC workers in the capacity limit and block replacement work until they exit." },
+        { "rank": 3, "severity": "High", "finding": "The application relies on Python's default thread executor.", "impact": "Thirty outlet tasks plus audit/log work approach the typical default worker ceiling and create hidden queueing.", "control": "Use a dedicated, explicitly sized executor and expose queue depth/active worker metrics." },
+        { "rank": 4, "severity": "High", "finding": "All outlets write audit/status data to one log database after commit.", "impact": "Completion bursts can increase log latency and produce Partial results even when outlet data committed.", "control": "Load-test log writes; batch audit inserts; move schema checks out of the hot path." },
+        { "rank": 5, "severity": "High", "finding": "Observed two-hour duration conflicts with the default one-hour full-cycle watchdog.", "impact": "The service may cancel pending work before completion or the reviewed configuration may not match production.", "control": "Confirm deployed settings/build and align watchdogs to measured p99 duration before changing concurrency." },
+        { "rank": 6, "severity": "Medium", "finding": "Manual syncs and retries share the same semaphore with the full cycle.", "impact": "Retries and operator actions can consume capacity and make stage comparisons inconsistent.", "control": "Suppress/defer nonessential manual work during tests and report capacity by trigger type." },
+        { "rank": 7, "severity": "Medium", "finding": "Index and execution-plan health is not proven across 1,000 heterogeneous outlets.", "impact": "A minority of slow outlets can hold transactions, hit watchdogs, and dominate tail duration.", "control": "Inventory indexes and compare p95/p99 outlet durations and blocking at every stage." },
+        { "rank": 8, "severity": "Low", "finding": "The configuration validator permits values through 100 and per-outlet locks prevent same-outlet overlap.", "impact": "There is no application-level hard barrier specifically at 30.", "control": "Retain the locks and single-cycle guard; validate them with regression tests in CI." }
+      ],
+      "scenarios": [
+        { "concurrency": 10, "waves": 100, "ideal_minutes": 120.0, "interpretation": "Operator-provided baseline." },
+        { "concurrency": 15, "waves": 67, "ideal_minutes": 80.4, "interpretation": "First recommended production stage." },
+        { "concurrency": 20, "waves": 50, "ideal_minutes": 60.0, "interpretation": "Promote only if shared-resource headroom remains." },
+        { "concurrency": 25, "waves": 40, "ideal_minutes": 48.0, "interpretation": "High-load validation stage." },
+        { "concurrency": 30, "waves": 34, "ideal_minutes": 40.8, "interpretation": "Best-case target; actual duration will be longer if contention rises." }
+      ],
+      "gates": [
+        { "order": 1, "gate": "Correctness", "pass_condition": "CapturedCount equals LoggedCount for every successful outlet; no duplicate or missing price-audit events.", "rollback": "Any unexplained audit mismatch, data discrepancy, or increased Partial status." },
+        { "order": 2, "gate": "Reliability", "pass_condition": "Timeout, deadlock, connection-failure, and retry rates do not materially exceed the 10-worker baseline.", "rollback": "Any sustained increase or correlated failure burst." },
+        { "order": 3, "gate": "Head Office capacity", "pass_condition": "CPU, storage latency, waits, linked-server sessions, and network remain within the DBA-approved headroom.", "rollback": "Threshold breach or user-facing workload degradation." },
+        { "order": 4, "gate": "Log database capacity", "pass_condition": "Audit/status p95 latency remains stable and no audit connection/query timeouts occur.", "rollback": "Partial results or material p95/p99 latency increase." },
+        { "order": 5, "gate": "Tail latency", "pass_condition": "Outlet p95/p99 duration and maximum draining count remain bounded; no accumulating ODBC worker queue.", "rollback": "Growing drain count, worker starvation, or worse p99 despite lower total time." },
+        { "order": 6, "gate": "Business outcome", "pass_condition": "Total cycle time improves materially at each stage without sacrificing gates 1–5.", "rollback": "Less than 10–15% incremental improvement from the prior stage or any correctness/reliability regression." }
+      ]
+    }
+  },
+  "sources": [
+    {
+      "id": "audit_evidence",
+      "label": "Concurrency audit evidence and calculations",
+      "path": "docs/CONCURRENCY_30_AUDIT_EVIDENCE.md",
+      "query": {
+        "engine": "sqlserver",
+        "language": "sql",
+        "description": "Reproducible tabular encoding of the static code-review risk register and rollout gates documented in the audit evidence file.",
+        "sql": "SELECT rank, severity, finding, impact, control FROM (VALUES (1, 'Critical', 'Shared Head Office full-table reads', 'Central resource saturation', 'Stage-load test and telemetry'), (2, 'High', 'Timed-out ODBC work can drain after semaphore release', 'Effective work can exceed configured concurrency', 'Count draining workers in the limiter'), (3, 'High', 'Default thread executor is not explicitly sized', 'Hidden worker queueing', 'Configure a dedicated executor'), (4, 'High', 'One shared log database receives completion bursts', 'Audit latency and Partial outcomes', 'Batch writes and load-test logging'), (5, 'High', 'Two-hour observation conflicts with one-hour watchdog', 'Premature cycle termination or configuration drift', 'Reconcile deployed settings'), (6, 'Medium', 'Manual and retry work share capacity', 'Inconsistent test load', 'Control work by trigger'), (7, 'Medium', 'Outlet index and plan health is unverified', 'Long-tail latency and blocking', 'Inventory indexes and plans'), (8, 'Low', 'Configuration and outlet locks permit 30', 'No hard application barrier', 'Retain and regression-test controls')) AS R(rank, severity, finding, impact, control) ORDER BY rank; SELECT gate_order, gate_name, pass_condition, rollback_trigger FROM (VALUES (1, 'Correctness', 'Audit counts and outlet data reconcile', 'Any unexplained mismatch'), (2, 'Reliability', 'Timeout and failure rates remain at baseline', 'Sustained regression'), (3, 'Head Office capacity', 'DB and network remain within approved headroom', 'Threshold breach'), (4, 'Log database capacity', 'Audit write latency remains stable', 'Partial outcomes or timeout'), (5, 'Tail latency', 'p95 and p99 plus drain count remain bounded', 'Worker starvation or growing drain count'), (6, 'Business outcome', 'Each stage materially improves total duration', 'Less than 10 to 15 percent gain')) AS G(gate_order, gate_name, pass_condition, rollback_trigger) ORDER BY gate_order;",
+        "executed_at": "2026-07-19T00:00:00+06:00"
+      }
+    },
+    {
+      "id": "model_calculation",
+      "label": "Idealized concurrency scenario calculation",
+      "path": "docs/CONCURRENCY_30_AUDIT_EVIDENCE.md",
+      "query": {
+        "engine": "sqlserver",
+        "language": "sql",
+        "description": "Calculates outlet waves and ideal duration from 1,000 outlets and a 1.2-minute average wave implied by the stated 120-minute baseline at concurrency 10.",
+        "sql": "WITH Scenario(concurrency) AS (SELECT concurrency FROM (VALUES (10), (15), (20), (25), (30)) AS V(concurrency)) SELECT concurrency, CEILING(1000.0 / concurrency) AS waves, CEILING(1000.0 / concurrency) * 1.2 AS ideal_minutes FROM Scenario ORDER BY concurrency;",
+        "executed_at": "2026-07-19T00:00:00+06:00",
+        "tables_used": []
+      }
+    }
+  ]
+}

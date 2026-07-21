@@ -1,0 +1,10 @@
+Log_Reports/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.xlsx
+*.bat
+*.git
+.env
+CustomerInfoUpdate*.py
