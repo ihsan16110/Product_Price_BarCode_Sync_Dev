@@ -6,7 +6,7 @@ services:
     container_name: product-price-sync
 
     ports:
-      - "8002:8000"
+      - "8003:8000"
 
     environment:
       - TZ=Asia/Dhaka
