@@ -50,7 +50,10 @@ FROM OPENQUERY([{linked_server_id}],
             VAT, MRP, MinStock, MaxStock, MinOrderQty, Active, DiscountStatus,
             ExpiryManagement, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate,
             PosType
-     FROM [{central_db_id}].dbo.RepProduct');
+     FROM [{central_db_id}].dbo.RepProduct
+     WHERE SyncStatus = ''N''
+     AND DepotCode = ''{outlet_code_literal}''
+     ');
 
 -- Load pending non-delete price rows. Delete markers are deliberately excluded
 -- so a deleted outlet row cannot be inserted again later in this batch.
@@ -97,7 +100,9 @@ INSERT INTO #HoBarcode
 SELECT ProductCode, BarCode, CreatedBy, CreatedDate, Active
 FROM OPENQUERY([{linked_server_id}],
     'SELECT ProductCode, BarCode, CreatedBy, CreatedDate, Active
-     FROM [{central_db_id}].dbo.RepProductBarcode');
+     FROM [{central_db_id}].dbo.RepProductBarcode
+     WHERE SyncStatus = ''N''
+     AND DepotCode = ''{outlet_code_literal}''');
 
 -- Synchronize Product.
 INSERT INTO Product (
