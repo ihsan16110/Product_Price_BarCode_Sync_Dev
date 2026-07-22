@@ -23,8 +23,10 @@ def _ensure_audit_schema_cached(cursor) -> None:
         if _audit_schema_ready:
             return
         _ensure_sync_log_table(cursor)
-        _ensure_price_change_table(cursor)
-        _ensure_sync_history_table(cursor)
+        if settings.ENABLE_PRODUCT_PRICE_CHANGE_LOG:
+            _ensure_price_change_table(cursor)
+        if settings.ENABLE_PRODUCT_SYNC_LOG_HISTORY:
+            _ensure_sync_history_table(cursor)
         _ensure_service_state_tables(cursor)
         _audit_schema_ready = True
 
@@ -456,6 +458,8 @@ async def log_product_price_changes(
     changes: list[dict], outlet_code: str, run_id: str | None = None
 ) -> int:
     """Async wrapper for inserting price change records."""
+    if not settings.ENABLE_PRODUCT_PRICE_CHANGE_LOG:
+        return 0
     return await asyncio.to_thread(
         _insert_price_changes_blocking, changes, outlet_code, run_id
     )
@@ -492,6 +496,8 @@ def _insert_sync_history_blocking(result: dict) -> bool:
 
 
 async def log_sync_history(result: dict) -> bool:
+    if not settings.ENABLE_PRODUCT_SYNC_LOG_HISTORY:
+        return False
     return await asyncio.to_thread(_insert_sync_history_blocking, result)
 
 

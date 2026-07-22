@@ -7,7 +7,6 @@ from app.config import settings
 from app.database import make_connection
 from app.logger import get_logger
 from app.db_logger import (
-    log_product_price_changes,
     log_sync_history,
     update_product_sync_log,
 )
@@ -19,57 +18,91 @@ from app.sync_sql import (
 
 logger = get_logger(__name__)
 
-PRICE_CHANGES_MARKER = "PRICE_CHANGES"
-PRICE_CHANGE_SUMMARY_MARKER = "PRICE_CHANGE_SUMMARY"
+HO_ACKNOWLEDGEMENTS_MARKER = "HO_ACKNOWLEDGEMENTS"
+HO_ACK_SUMMARY_MARKER = "HO_ACK_SUMMARY"
 
 
-def _extract_price_changes(cursor) -> tuple[list[dict], int]:
-    """Read and validate the audit summary/details from all ODBC result sets."""
-    price_changes: list[dict] = []
-    captured_count: int | None = None
+def _extract_ho_acknowledgements(cursor) -> tuple[list[tuple[str, str]], int]:
+    """Read and validate HO acknowledgement keys from all ODBC result sets."""
+    acknowledgements: list[tuple[str, str]] = []
+    expected_count: int | None = None
 
     while True:
         if cursor.description:
             rows = cursor.fetchall()
             if rows:
                 marker = str(rows[0][0])
-                if marker == PRICE_CHANGE_SUMMARY_MARKER:
-                    captured_count = int(rows[0][1])
-                elif marker == PRICE_CHANGES_MARKER:
+                if marker == HO_ACK_SUMMARY_MARKER:
+                    expected_count = int(rows[0][1])
+                elif marker == HO_ACKNOWLEDGEMENTS_MARKER:
                     for row in rows:
-                        price_changes.append({
-                            "event_id": str(uuid4()),
-                            "change_type": str(row[1]),
-                            "product_code": str(row[2]),
-                            "depot_code": str(row[3]) if row[3] else "",
-                            "old_unit_price": float(row[4]) if row[4] is not None else None,
-                            "new_unit_price": float(row[5]) if row[5] is not None else None,
-                            # Keep database timestamps as native datetime objects so
-                            # pyodbc can bind them directly to SQL Server date columns.
-                            "old_modified_date": row[6] if row[6] else None,
-                            "new_modified_date": row[7] if row[7] else None,
-                            "modified_by": str(row[8]) if row[8] else None,
-                        })
+                        product_code = str(row[1]).strip() if row[1] is not None else ""
+                        depot_code = str(row[2]).strip() if row[2] is not None else ""
+                        if not product_code or not depot_code:
+                            raise RuntimeError("HO acknowledgement contains an empty key")
+                        acknowledgements.append((product_code, depot_code))
         if not cursor.nextset():
             break
 
-    if captured_count is None:
-        raise RuntimeError("ProductPrice audit summary result set was not returned")
-    if captured_count != len(price_changes):
+    if expected_count is None:
+        raise RuntimeError("HO acknowledgement summary result set was not returned")
+    if expected_count != len(acknowledgements):
         raise RuntimeError(
-            f"ProductPrice audit count mismatch: captured={captured_count}, "
-            f"returned={len(price_changes)}"
+            f"HO acknowledgement count mismatch: expected={expected_count}, "
+            f"returned={len(acknowledgements)}"
         )
-    return price_changes, captured_count
+    return acknowledgements, expected_count
+
+
+def _acknowledge_ho_blocking(acknowledgements: list[tuple[str, str]]) -> int:
+    """Mark exact RepProductPrice keys sent after the outlet commit succeeds."""
+    if not acknowledgements:
+        return 0
+
+    conn = None
+    unique_keys = list(dict.fromkeys(acknowledgements))
+    try:
+        conn = make_connection(
+            server=settings.HO_SERVER,
+            database=settings.HO_DATABASE,
+            user=settings.HO_DB_USERNAME,
+            password=settings.HO_DB_PASSWORD,
+            autocommit=False,
+        )
+        conn.timeout = settings.QUERY_TIMEOUT
+        cursor = conn.cursor()
+        cursor.fast_executemany = True
+        cursor.executemany(
+            """
+            UPDATE dbo.RepProductPrice
+            SET SyncStatus = 'Y', SentTime = GETDATE()
+            WHERE SyncStatus = 'N'
+              AND ProductCode = ?
+              AND DepotCode = ?
+            """,
+            unique_keys,
+        )
+        conn.commit()
+        return len(unique_keys)
+    except Exception:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception as rollback_error:
+                logger.error(f"Head Office acknowledgement rollback failed: {rollback_error}")
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _run_on_outlet_blocking(outlet: dict) -> dict:
     """
     Execute the sync SQL batch on a single outlet server.
     Blocking version - run via asyncio.to_thread().
-    Captures price change data from the marker result set for audit logging.
+    Captures Head Office acknowledgement keys from the marker result set.
     Returns a result dict with outlet_code, ip, status, remarks, timestamp, duration,
-    and optionally price_changes (list of dicts).
+    plus the acknowledgement keys consumed by the async wrapper.
     """
     name = outlet.get("Outlet", "Unknown")
     run_id = str(outlet.get("_run_id") or uuid4())
@@ -91,11 +124,12 @@ def _run_on_outlet_blocking(outlet: dict) -> dict:
             "remarks": msg,
             "timestamp": datetime.now().isoformat(),
             "duration_seconds": 0.0,
-            "price_changes": [],
             "run_id": run_id,
             "captured_count": 0,
             "logged_count": 0,
             "audit_status": "NotApplicable",
+            "ho_ack_status": "NotAttempted",
+            "ho_ack_count": 0,
         }
 
     conn = None
@@ -134,11 +168,10 @@ def _run_on_outlet_blocking(outlet: dict) -> dict:
         )
         cursor.execute(sync_sql)
 
-        price_changes, captured_count = _extract_price_changes(cursor)
+        acknowledgements, acknowledgement_count = _extract_ho_acknowledgements(cursor)
         logger.info(
-            f"RunId={run_id} Outlet={name} CapturedCount={captured_count} "
-            f"INSERT={sum(c['change_type'] == 'INSERT' for c in price_changes)} "
-            f"UPDATE={sum(c['change_type'] == 'UPDATE' for c in price_changes)}"
+            f"RunId={run_id} Outlet={name} "
+            f"HOAcknowledgementCount={acknowledgement_count}"
         )
 
         # Product, ProductPrice, and ProductBarcode changes succeed or roll back
@@ -154,12 +187,14 @@ def _run_on_outlet_blocking(outlet: dict) -> dict:
             "remarks": "Y",
             "timestamp": datetime.now().isoformat(),
             "duration_seconds": round(duration, 2),
-            "price_changes": price_changes,
+            "ho_acknowledgements": acknowledgements,
             "run_id": run_id,
             "trigger": trigger,
-            "captured_count": captured_count,
+            "captured_count": 0,
             "logged_count": 0,
-            "audit_status": "Pending" if captured_count else "NoChanges",
+            "audit_status": "Disabled",
+            "ho_ack_status": "Pending" if acknowledgement_count else "NoData",
+            "ho_ack_count": 0,
         }
 
     except Exception as e:
@@ -179,12 +214,13 @@ def _run_on_outlet_blocking(outlet: dict) -> dict:
             "remarks": error_msg,
             "timestamp": datetime.now().isoformat(),
             "duration_seconds": round(duration, 2),
-            "price_changes": [],
             "run_id": run_id,
             "trigger": trigger,
             "captured_count": 0,
             "logged_count": 0,
             "audit_status": "NotApplicable",
+            "ho_ack_status": "NotAttempted",
+            "ho_ack_count": 0,
         }
     finally:
         if conn is not None:
@@ -199,26 +235,22 @@ async def run_on_outlet(outlet: dict) -> dict:
     result = await asyncio.to_thread(_run_on_outlet_blocking, outlet)
 
     if result["status"] == "Success":
-        price_changes = result.get("price_changes", [])
+        acknowledgements = result.pop("ho_acknowledgements", [])
         try:
-            logged_count = 0
-            if price_changes:
-                logged_count = await log_product_price_changes(
-                    changes=price_changes,
-                    outlet_code=result["outlet_code"],
-                    run_id=result["run_id"],
+            acknowledged_count = 0
+            if acknowledgements:
+                acknowledged_count = await asyncio.to_thread(
+                    _acknowledge_ho_blocking, acknowledgements
                 )
-            result["logged_count"] = logged_count
-            if logged_count != result["captured_count"]:
-                raise RuntimeError(
-                    f"audit count mismatch: captured={result['captured_count']}, "
-                    f"logged={logged_count}"
-                )
-            result["audit_status"] = "Logged" if logged_count else "NoChanges"
-        except Exception as audit_error:
+            result["ho_ack_count"] = acknowledged_count
+            result["ho_ack_status"] = "Acknowledged" if acknowledged_count else "NoData"
+        except Exception as acknowledgement_error:
             result["status"] = "Partial"
-            result["audit_status"] = "AuditFailed"
-            result["remarks"] = f"Outlet sync succeeded; audit logging failed: {audit_error}"
+            result["ho_ack_status"] = "Failed"
+            result["remarks"] = (
+                "Outlet sync succeeded; Head Office acknowledgement failed: "
+                f"{acknowledgement_error}"
+            )
 
     summary_written = await update_product_sync_log(
         outlet_code=result["outlet_code"],
@@ -230,18 +262,19 @@ async def run_on_outlet(outlet: dict) -> dict:
             f"RunId={result['run_id']} Outlet={result['outlet_code']} "
             "ProductSyncLog update failed"
         )
-    try:
-        await log_sync_history(result)
-    except Exception as history_error:
-        logger.error(
-            f"RunId={result['run_id']} Outlet={result['outlet_code']} "
-            f"ProductSyncLogHistory write failed: {history_error}"
-        )
+    if settings.ENABLE_PRODUCT_SYNC_LOG_HISTORY:
+        try:
+            await log_sync_history(result)
+        except Exception as history_error:
+            logger.error(
+                f"RunId={result['run_id']} Outlet={result['outlet_code']} "
+                f"ProductSyncLogHistory write failed: {history_error}"
+            )
 
     logger.info(
         f"RunId={result['run_id']} Outlet={result['outlet_code']} "
-        f"SyncStatus={result['status']} AuditStatus={result['audit_status']} "
-        f"CapturedCount={result['captured_count']} LoggedCount={result['logged_count']}"
+        f"SyncStatus={result['status']} HOAckStatus={result['ho_ack_status']} "
+        f"HOAckCount={result['ho_ack_count']}"
     )
 
     return result

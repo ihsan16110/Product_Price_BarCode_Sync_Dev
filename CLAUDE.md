@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This FastAPI service synchronizes Product, ProductPrice, and ProductBarcode information from a central SQL Server database ("Head Office") to multiple outlet SQL Server databases ("Depots"). APScheduler triggers periodic full-sync cycles, `SyncManager` throttles concurrency with a semaphore, and failed outlets enter a SQL-persisted retry queue with exponential backoff. A web dashboard provides real-time monitoring, manual controls, schedule configuration, and price change audit trail.
+This FastAPI service synchronizes queued Product, ProductPrice, and ProductBarcode information from Head Office `Rep*` tables to multiple outlet SQL Server databases ("Depots"). APScheduler triggers periodic full-sync cycles, `SyncManager` throttles concurrency with a semaphore, and failed outlets enter a SQL-persisted retry queue with exponential backoff. After an outlet transaction commits, the service directly acknowledges the exact processed `RepProductPrice` keys at Head Office. A web dashboard provides real-time monitoring, manual controls, and schedule configuration.
 
 ---
 
@@ -31,14 +31,14 @@ This FastAPI service synchronizes Product, ProductPrice, and ProductBarcode info
 │                        │                               │
 │  ┌─────────────────────▼──────────────────────────┐   │
 │  │           sync_engine.py                        │   │
-│  │  (pyodbc: outlet sync + linked server setup)   │   │
-│  │  + price_changes OUTPUT capture via marker     │   │
+│  │  (outlet transaction + linked server setup)    │   │
+│  │  + post-commit Head Office acknowledgement     │   │
 │  └─────────────────────┬──────────────────────────┘   │
 │                        │                               │
 │  ┌─────────────────────▼──────────────────────────┐   │
 │  │           db_logger.py                          │   │
-│  │  ├─ SyncLog (latest status, UPSERT)     │   │
-│  │  └─ ProductPriceChangeLog (audit trail, INSERT)│   │
+│  │  ├─ ProductSyncLog (latest status, UPSERT)     │   │
+│  │  └─ service state/cycle/retry persistence      │   │
 │  └────────────────────────────────────────────────┘   │
 │                                                        │
 │  ┌─────────────┐  ┌──────────┐  ┌─────────────────┐  │
@@ -58,12 +58,13 @@ This FastAPI service synchronizes Product, ProductPrice, and ProductBarcode info
 4. Active outlets are dispatched through an `asyncio.Semaphore` (default max 10 concurrent)
 5. Each outlet runs inside a per-outlet watchdog (`OUTLET_SYNC_TIMEOUT`, default 180s)
 6. The full cycle runs inside a cycle-level watchdog (`FULL_SYNC_TIMEOUT`, default 10800s)
-7. During sync, SQL audit instrumentation captures new ProductPrice rows as `INSERT` and changed existing rows as `UPDATE` via `OUTPUT INTO @PriceChanges`, without changing the existing row-selection joins/filters
-8. Results are stored in the central `SyncLog` table via `db_logger.py` (latest status, UPSERT)
-9. ProductPrice audit events are logged to `ProductPriceChangeLog` with EventID, RunID, ChangeType, before/after values, captured/logged counts, and explicit audit status
-10. Both central DB writes run **concurrently** via `asyncio.gather()`
-11. Failed outlets enter the `RetryQueue` with exponential backoff
-12. **RetryProcessor** polls every 10s for due retries and re-dispatches them
+7. Outlet SQL reads `RepProduct`, pending non-delete `RepProductPrice`, delete-marked `RepProductPrice`, and `RepProductBarcode` through the configured linked server
+8. Product, ProductPrice, ProductPrice deletions, and ProductBarcode changes commit as one outlet transaction
+9. SQL returns marker result sets containing the distinct processed `(ProductCode, DepotCode)` acknowledgement keys
+10. Only after the outlet commit, Python connects directly with `HO_*` credentials and updates matching pending `RepProductPrice` rows to `SyncStatus='Y'`, `SentTime=GETDATE()`
+11. A failed HO acknowledgement produces `Partial`; the HO rows remain pending and can be processed again idempotently
+12. Results are stored in `ProductSyncLog`; legacy price-change and sync-history audit writes are disabled by default
+13. Failed outlets enter the `RetryQueue` with exponential backoff; the **RetryProcessor** polls every 10s for due retries
 
 ---
 
@@ -76,7 +77,8 @@ Uses `pydantic-settings` BaseSettings loaded from `.env` file. All settings are 
 | Group | Variables | Description |
 |-------|-----------|-------------|
 | Central DB | `SOURCE_SERVER`, `SOURCE_DATABASE`, `SOURCE_USER`, `SOURCE_PASSWORD` | Head Office SQL Server |
-| Log DB | `LOG_SERVER`, `LOG_DATABASE`, `LOG_USER`, `LOG_PASSWORD` | SyncLog and ProductPriceChangeLog SQL Server |
+| HO acknowledgement | `HO_SERVER`, `HO_DATABASE`, `HO_DB_USERNAME`, `HO_DB_PASSWORD` | Direct post-commit update of `RepProductPrice.SyncStatus` and `SentTime` |
+| Log DB | `LOG_SERVER`, `LOG_DATABASE`, `LOG_USER`, `LOG_PASSWORD` | ProductSyncLog and persistent service state SQL Server |
 | Sync SQL | `CENTRAL_DB`, `CENTRAL_LINKED_SERVER_NAME`, `LOCAL_DB` | DB names used in sync queries |
 | Outlet Auth | `OUTLET_DB_USER`, `OUTLET_DB_PASSWORD` | Shared credentials for all outlets |
 | Timeouts | `CONNECT_TIMEOUT` (10s), `QUERY_TIMEOUT` (120s) | SQL Server timeouts |
@@ -86,11 +88,12 @@ Uses `pydantic-settings` BaseSettings loaded from `.env` file. All settings are 
 | Retry | `RETRY_MAX_ATTEMPTS` (3), `RETRY_BASE_DELAY` (30s) | Retry policy |
 | Concurrency | `MAX_CONCURRENT_SYNCS` (20), `THREAD_POOL_MAX_WORKERS` (40) | Max simultaneous outlet syncs and explicit blocking-ODBC worker capacity |
 | Security | `ADMIN_API_KEY`, `VIEWER_API_KEY`, `ADMIN_RATE_LIMIT_PER_MINUTE` | Operator/viewer authorization and administrative request limiting |
-| Retention/audit | `PRICE_CHANGE_RETENTION_DAYS` (90), `PRICE_CHANGE_INSERT_BATCH_SIZE` (500) | ProductPriceChangeLog retention and batched audit-write size |
+| Legacy audit flags | `ENABLE_PRODUCT_PRICE_CHANGE_LOG=false`, `ENABLE_PRODUCT_SYNC_LOG_HISTORY=false` | Dormant audit tables; keep disabled unless deliberately reactivating and validating the old subsystem |
+| Retention/audit | `PRICE_CHANGE_RETENTION_DAYS` (90), `PRICE_CHANGE_INSERT_BATCH_SIZE` (500) | Used only when legacy price-change auditing is enabled |
 
 **Important:** The singleton `settings = Settings()` is imported by every module.
 
-**Current database role mapping:** Product/outlet source reads use the existing `SOURCE_*` connection (`192.168.11.200 / EPSMirror`). `ProductSyncLog` and `ProductPriceChangeLog` use the independent `LOG_*` connection (`192.168.11.221 / ProdPriceSync`). Do not route log-table operations through `SOURCE_*`; `db_logger.py`, log DB health checks, price-history reads, and cleanup all use `LOG_*`.
+**Current database role mapping:** `SOURCE_*` loads the active outlet list. Outlet SQL reads the Head Office `Rep*` queues through `CENTRAL_LINKED_SERVER_NAME`. After the outlet commit, `HO_*` performs the direct acknowledgement update. `LOG_*` remains independent and stores `ProductSyncLog` plus service/cycle/retry state. Do not substitute `SOURCE_*` or `LOG_*` for the `HO_*` acknowledgement connection.
 
 ### `app/main.py` — Application Entry Point
 
@@ -120,30 +123,35 @@ Uses `pydantic-settings` BaseSettings loaded from `.env` file. All settings are 
 ### `app/sync_sql.py` — SQL Templates
 
 - `get_sync_sql()` — Generates the full SQL batch for each outlet:
-  1. Pull Product data from central via OPENQUERY into `#HoProduct`
-  2. Pull ProductPrice data from central (filtered by depot + date range) into `#HoProductPrice`
-  3. Pull ProductBarcode data from central into `#HoBarcode`
-  4. INSERT new products not found locally
-  5. UPDATE existing products (ProductName, UnitPrice, Active, VATPerc, VAT)
-  6. INSERT new product prices not found locally
-  7. **Conditional UPDATE on ProductPrice**: uses `#ChangedPrices` temp table to identify rows where `UnitPrice` or `ModifiedDate` actually changed (NULL-safe comparisons), then UPDATEs only those rows via `INNER JOIN #ChangedPrices`. Captures old/new values via `OUTPUT INTO @PriceChanges`.
-  8. INSERT new barcodes not found locally
-  9. **Marker SELECT**: `SELECT 'PRICE_CHANGES' AS Marker, ProductCode, DepotCode, OldUnitPrice, NewUnitPrice, OldModifiedDate, NewModifiedDate, ModifiedBy FROM @PriceChanges` — Python reads this result set to get the change data for audit logging.
-  10. DROP all temp tables (including `#ChangedPrices`)
-- `SET NOCOUNT ON` is used at the top of the batch to suppress rowcount messages, ensuring the marker SELECT is the only result set the client receives.
+  1. Pull `RepProduct` data via OPENQUERY into `#HoProduct`
+  2. Pull pending non-delete `RepProductPrice` rows for the Python-supplied outlet code into `#HoProductPrice`
+  3. Pull pending `SyncType='D'` rows separately into `#HoProductPriceDelete`
+  4. Pull `RepProductBarcode` into `#HoBarcode`
+  5. INSERT new products and UPDATE the five product fields from the supplied SQL
+  6. DELETE local ProductPrice rows identified by delete markers before normal upserts
+  7. INSERT missing ProductPrice rows; `Price='Y'` uses the incoming UnitPrice, otherwise a missing row receives the supplied fallback of zero
+  8. UPDATE matching ProductPrice rows; `Price='Y'` controls only UnitPrice while the other supplied fields retain the reference-query behavior
+  9. INSERT missing ProductBarcode pairs
+  10. Return `HO_ACK_SUMMARY` and `HO_ACKNOWLEDGEMENTS` marker result sets containing the union of upsert and delete keys
+  11. DROP all temp tables
+- `SyncType='D'` is deliberately excluded from `#HoProductPrice`. This is a behavior correction from the reference SQL, which otherwise deletes a row and can reinsert it from the normal upsert temp table.
+- The outlet code comes from the Python outlet record rather than `SELECT @vDepotCode FROM Depot`; this keeps queue selection tied to the outlet being processed.
+- Identifiers and the nested OPENQUERY outlet literal are escaped before interpolation.
 - `LINKED_SERVER_CHECK_SQL` — `SELECT COUNT(*) FROM sys.servers WHERE name = ?`
 - `LINKED_SERVER_CREATE_TEMPLATE` — `sp_addlinkedserver` with SQLNCLI provider
 
 ### `app/sync_engine.py` — Outlet Sync Execution
 
-- `_run_on_outlet_blocking()` — Connects to one outlet, ensures linked server exists, runs the sync SQL batch as a **single `cursor.execute()` call** (not split by `;`). After execution, reads the `PRICE_CHANGES` marker result set via `cursor.fetchall()` and returns the change data in the result dict under `price_changes` key.
+- `_run_on_outlet_blocking()` — Connects to one outlet, ensures the linked server exists, runs the sync SQL as a single `cursor.execute()`, validates the acknowledgement summary/details, then commits the outlet transaction.
 - Outlet connections use `autocommit=False`. Linked-server administration is committed separately, then Product, ProductPrice, and ProductBarcode changes commit as one unit. Any sync exception calls `rollback()`.
 - `run_on_outlet()` — Async wrapper that:
   1. Runs the blocking sync via `asyncio.to_thread()`
-  2. Calls both `update_product_sync_log()` and `log_product_price_changes()` **concurrently** via `asyncio.gather()`
+  2. After success, calls `_acknowledge_ho_blocking()` in a worker thread with the returned keys
+  3. Marks the result `Partial` if direct HO acknowledgement fails; the outlet commit is not rolled back and HO rows remain `N`
+  4. Updates `ProductSyncLog`; writes `ProductSyncLogHistory` only when its feature flag is enabled
 - Connection cleanup in `finally` blocks prevents leaks
 - `conn.timeout = settings.QUERY_TIMEOUT` is set before cursor creation (pyodbc 5.3.0: `Cursor.timeout` does NOT exist)
-- `PRICE_CHANGES_MARKER` constant used for marker comparison
+- `_acknowledge_ho_blocking()` deduplicates keys and executes a parameterized `UPDATE dbo.RepProductPrice SET SyncStatus='Y', SentTime=GETDATE()` restricted by pending status, ProductCode, and DepotCode.
 
 ### `app/sync_manager.py` — Central Orchestrator
 
@@ -190,7 +198,7 @@ The `SyncManager` class is the heart of the service:
 
 ### `app/db_logger.py` — Central DB Log Writer
 
-Contains three logging subsystems:
+Contains the active status/state persistence subsystem plus dormant legacy audit code:
 
 **SyncLog** (latest per-outlet status, UPSERT):
 - `_update_sync_log_blocking()` — Creates `SyncLog` table if not exists, then UPSERTs the latest result
@@ -198,10 +206,15 @@ Contains three logging subsystems:
 - For success: updates `LastSyncStatus`, `LastSuccessfulSync`, `LastAttempt`, `Remarks`
 - For failure: updates `LastSyncStatus`, `LastAttempt`, `Remarks` (does NOT update `LastSuccessfulSync`)
 
-**ProductPriceChangeLog** (per-row audit trail, INSERT-only):
+**Legacy ProductPriceChangeLog** (disabled by default):
+- `ENABLE_PRODUCT_PRICE_CHANGE_LOG=false` prevents schema creation and makes the public logging wrapper a no-op. The active sync path no longer captures `@PriceChanges` and does not call this subsystem.
 - `_ensure_price_change_table()` — Creates `ProductPriceChangeLog` with event/run identifiers, change type, before/after values, and **two indexes**: `IX_ProductPriceChangeLog_ProductDepot` on `(ProductCode, DepotCode, ChangeOccurrenceTime DESC)` for lookup queries, and `IX_ProductPriceChangeLog_ChangeOccurrenceTime` on `(ChangeOccurrenceTime DESC)` for cleanup queries. Both use `IF NOT EXISTS` guards. Startup migration removes the obsolete `PriceDeltaPercent` computed column when upgrading an existing database.
-- `_insert_price_changes_blocking()` — Inserts price change records from the captured `@PriceChanges` data. Uses parameterized queries. Called from `sync_engine.py` after each outlet sync.
+- `_insert_price_changes_blocking()` — Retained for possible deliberate reactivation; it is not called by the active sync engine.
 - `log_product_price_changes()` — Async wrapper via `asyncio.to_thread()`
+
+**Legacy ProductSyncLogHistory** (disabled by default):
+- `ENABLE_PRODUCT_SYNC_LOG_HISTORY=false` prevents schema creation and per-attempt history writes.
+- `ProductSyncLog` latest-status UPSERT and service/cycle/retry persistence remain active and are not controlled by this flag.
 
 **ProductPriceChangeLog Cleanup** (scheduled purge, daily at midnight + manual trigger):
 - `_cleanup_price_changes_blocking()` — Purges old records in **batches** using `DELETE TOP (?)` in a `WHILE` loop. Accepts `retention_days` and `batch_size` (default 5000). Each batch commits independently (autocommit mode), keeping transaction log growth bounded. The dedicated `IX_ProductPriceChangeLog_ChangeOccurrenceTime` index makes the WHERE clause seekable instead of scanning the clustered index. Returns total rows deleted across all batches.
@@ -249,7 +262,7 @@ ChangedBy               VARCHAR(50)     NULL
 | Model | Fields | Purpose |
 |-------|--------|---------|
 | `OutletInfo` | outlet_code, server, database, user, password | Outlet connection details |
-| `SyncResult` | outlet_code, ip, status, remarks, timestamp, duration_seconds | Per-outlet sync outcome (also carries `price_changes` list internally) |
+| `SyncResult` | outlet_code, ip, status, remarks, timestamp, duration_seconds, ho_ack_status, ho_ack_count | Per-outlet sync outcome; the blocking phase temporarily carries `ho_acknowledgements`, which the async wrapper consumes before returning the API result |
 | `SyncCycleStatus` | state, started_at, finished_at, total_outlets, completed, failed, in_progress, trigger | Cycle-level status |
 | `RetryEntry` | outlet_code, server, attempt, max_attempts, next_retry_at, last_error, added_at | Retry queue entry |
 | `ServiceStatus` | service, uptime_seconds, current_sync, schedule_interval_minutes, next_scheduled_run, retry_queue_size, total_syncs_completed | Full service status |
@@ -362,36 +375,25 @@ SyncManager.sync_lock (asyncio.Lock)
 
 **Rule:** Keep `OUTLET_SYNC_TIMEOUT > QUERY_TIMEOUT` so ODBC aborts the SQL statement before the asyncio watchdog fires. This ensures clean query cancellation rather than forced task cancellation.
 
-### Price Change Tracking Flow
+### Active ProductPrice Queue and Acknowledgement Flow
 
 ```
-OUTLET sync SQL executes
+OUTLET sync SQL executes in one transaction
   │
-  ├─▶ INSERT new ProductPrice rows (unchanged)
+  ├─▶ Read pending non-delete RepProductPrice rows for the outlet
   │
-  ├─▶ #ChangedPrices temp table identifies changed rows:
-  │     P.UnitPrice <> D.UnitPrice OR P.ModifiedDate <> D.ModifiedDate
-  │     (with NULL-safe comparisons)
+  ├─▶ Read SyncType='D' rows into a separate delete temp table
   │
-  ├─▶ Conditional UPDATE with OUTPUT INTO @PriceChanges:
-  │     UPDATE ProductPrice SET ...
-  │     OUTPUT INSERTED.ProductCode, INSERTED.DepotCode,
-  │            DELETED.UnitPrice, INSERTED.UnitPrice,
-  │            DELETED.ModifiedDate, INSERTED.ModifiedDate,
-  │            INSERTED.ModifiedBy
-  │     INTO @PriceChanges
-  │     FROM ProductPrice P
-  │     INNER JOIN #HoProductPrice D ON ...
-  │     INNER JOIN #ChangedPrices C ON ...
+  ├─▶ DELETE markers, then INSERT/UPDATE normal ProductPrice rows
   │
-  ├─▶ SELECT 'PRICE_CHANGES' AS Marker, ... FROM @PriceChanges
-  │     → Python reads this result set via cursor.fetchall()
+  ├─▶ Return distinct upsert + delete (ProductCode, DepotCode) keys
+  │     as HO_ACK_SUMMARY and HO_ACKNOWLEDGEMENTS marker result sets
   │
-  └─▶ run_on_outlet() async wrapper:
-        asyncio.gather(
-            update_product_sync_log(),     # SyncLog UPSERT
-            log_product_price_changes()    # ProductPriceChangeLog INSERT
-        )
+  ├─▶ COMMIT outlet transaction
+  │
+  └─▶ Direct HO connection updates only matching pending keys:
+        SyncStatus='Y', SentTime=GETDATE()
+        Failure here => Partial; HO rows remain pending for a later cycle
 ```
 
 ### pyodbc 5.3.0 Details
@@ -458,11 +460,30 @@ Outlet `F786` (`172.22.186.41`) repeatedly hung during ODBC SQL execution. The o
 
 ---
 
+## Core Queue Workflow Change (22 July 2026)
+
+The active synchronization contract changed from date-based reads of live Product tables plus price-change auditing to queue-based replication and post-commit acknowledgement:
+
+- Outlet reads now use `RepProduct`, `RepProductPrice`, and `RepProductBarcode` through the linked server.
+- Pending ProductPrice rows are selected by `SyncStatus='N'` and the Python-supplied outlet code.
+- `SyncType='D'` rows are isolated in `#HoProductPriceDelete`, deleted locally, and excluded from normal price upserts. This intentionally corrects the supplied reference query's delete-then-reinsert hazard.
+- The supplied `Price` flag controls only UnitPrice: `Y` applies the incoming value; otherwise an existing price is preserved, while a missing row keeps the reference fallback of zero.
+- SQL returns distinct upsert and delete keys through `HO_ACK_SUMMARY` and `HO_ACKNOWLEDGEMENTS` result-set markers.
+- After the outlet transaction commits, Python connects directly using `HO_*` and updates only `RepProductPrice.SyncStatus` and `SentTime` for the exact pending keys.
+- HO acknowledgement failure is a `Partial` result. It never rolls back an already committed outlet transaction, and it deliberately leaves HO rows pending for a later idempotent cycle.
+- `ProductPriceChangeLog` and `ProductSyncLogHistory` are disabled by default through explicit feature flags. The latest `ProductSyncLog` and persistent service state remain active.
+- The depot-selection source changed from a local `Depot WHERE ActiveDepot='Y'` lookup in the reference SQL to the outlet code already selected by the Python orchestrator.
+- Linked-server discovery/creation occurs in Python before the outlet data transaction instead of through the reference query's `#LinkedServers` temp table.
+
+These are core behavioral rules. Future changes must preserve commit-before-ack ordering, parameterized direct HO updates, and delete/upsert separation unless a database-owner-approved migration explicitly replaces them.
+
 ## Subsequent Enhancements (17 July 2026)
 
 ### Conditional ProductPrice UPDATE with Change Tracking
 
-The ProductPrice UPDATE was changed from a blind overwrite to a conditional update:
+**Historical/dormant:** this implementation was superseded on 22 July 2026 by the `RepProductPrice` queue workflow. Its tables and writers remain in the codebase only behind disabled feature flags.
+
+The former ProductPrice UPDATE was changed from a blind overwrite to a conditional update:
 - Added `#ChangedPrices` temp table that identifies only rows where `UnitPrice` or `ModifiedDate` actually changed (with NULL-safe comparisons)
 - The UPDATE now uses `INNER JOIN #ChangedPrices` to write only to changed rows
 - Added `OUTPUT INTO @PriceChanges` to capture before/after values (old vs new UnitPrice and ModifiedDate)
@@ -488,7 +509,9 @@ Fixed `asyncio.CancelledError` propagation:
 
 ### Parallelized Central DB Logging
 
-Changed `run_on_outlet()` to run both logging operations concurrently:
+**Historical/dormant:** the price-change logging call described here is no longer part of the active sync path.
+
+Previously, `run_on_outlet()` ran both logging operations concurrently:
 - Before: sequential `await update_product_sync_log()` then `await log_product_price_changes()`
 - After: `await asyncio.gather(update_product_sync_log(), log_product_price_changes())`
 - Reduces per-outlet overhead by ~100-500ms
@@ -613,7 +636,7 @@ Production dependencies are exact-pinned in `requirements.txt`:
 6. Start with: `uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1`
 7. Confirm startup logs show all timeout/watchdog values and exclusion list
 8. Trigger a test cycle via API or wait for the first scheduled run
-9. Verify results appear in `SyncLog` and `ProductPriceChangeLog` tables in central DB
+9. Verify the outlet changes, `ProductSyncLog` result, and matching HO `RepProductPrice.SyncStatus='Y'`/`SentTime`; legacy audit tables are not expected when their flags are false
 10. Monitor logs for any outlets entering the retry queue
 
 ---
@@ -652,19 +675,21 @@ Production dependencies are exact-pinned in `requirements.txt`:
 3. **Exclusion discipline:** Do not remove an outlet from `EXCLUDED_OUTLETS` merely because a restart temporarily succeeds.
 4. **Diagnostic protocol:** Before re-enabling a previously excluded outlet, inspect SQL Server blocking sessions, linked-server waits, and network stability.
 5. **Active outlet monitoring:** Review `active_outlets` in status API and service logs whenever a schedule is skipped or a cycle runs unusually long.
-6. **Retry volatility:** The retry queue is in-memory and cleared by service restart. There is no persistent retry state.
+6. **Retry persistence:** Retry entries are cached in memory during operation and persisted in the log database for restoration after restart.
 7. **Single worker constraint:** Single uvicorn worker is required — in-memory state (retry queue, sync manager) would not synchronize across workers.
 8. **Credential security:** `.env` contains production credentials — never commit it. Use `.env.example` as a template.
 9. **Path prefix:** All endpoints are under `/ProductSync/` path prefix for reverse proxy compatibility.
-10. **Price change data persistence:** `ProductPriceChangeLog` is append-only and persists across restarts (stored in central DB, not in-memory).
-11. **Pause versus stop:** Pausing the schedule prevents future scheduled starts but does not cancel a running cycle. Stopping a cycle does not automatically pause its future schedule. Use both controls when maintenance requires no further sync work.
-12. **Graceful-stop semantics:** `asyncio.to_thread()` cannot terminate an active ODBC call. During `stopping`, wait for `active_outlets` to drain; queued outlets are cancelled immediately, but active statements finish or time out.
-13. **Cancellation and retries:** Operator-cancelled outlets must remain `Cancelled` and must not enter the automatic retry queue.
-14. **Draining outlet exclusivity:** Never remove or bypass the `outlet_operations` guard. A timed-out ODBC worker must finish before that outlet can be retried.
-15. **API authorization:** Mutating endpoints require the administrator key; log/history endpoints require viewer or administrator access. Never put either key in source code or committed configuration.
-16. **Browser key handling:** The dashboard stores its supplied key only in tab-scoped `sessionStorage`. Static assets must never contain a configured key.
-17. **Network boundary:** Keep port 8000 private and terminate HTTPS/authentication controls at a reverse proxy for production access.
-18. **Production image integrity:** Do not add `.:/app` back to production Compose. Use `docker-compose.dev.yml` when source mounting is required for development.
+10. **Legacy audit state:** `ProductPriceChangeLog` and `ProductSyncLogHistory` are disabled by default. Do not assume they are created or written unless their explicit feature flags are enabled and the old capture path has been deliberately restored.
+11. **Acknowledgement ordering:** Never acknowledge HO before the outlet transaction commits. HO acknowledgement failure must leave the queue rows pending and return `Partial`.
+12. **Delete separation:** Keep `SyncType='D'` rows out of the normal upsert temp table so deletion markers cannot recreate the rows they just deleted.
+13. **Pause versus stop:** Pausing the schedule prevents future scheduled starts but does not cancel a running cycle. Stopping a cycle does not automatically pause its future schedule. Use both controls when maintenance requires no further sync work.
+14. **Graceful-stop semantics:** `asyncio.to_thread()` cannot terminate an active ODBC call. During `stopping`, wait for `active_outlets` to drain; queued outlets are cancelled immediately, but active statements finish or time out.
+15. **Cancellation and retries:** Operator-cancelled outlets must remain `Cancelled` and must not enter the automatic retry queue.
+16. **Draining outlet exclusivity:** Never remove or bypass the `outlet_operations` guard. A timed-out ODBC worker must finish before that outlet can be retried.
+17. **API authorization:** Mutating endpoints require the administrator key; log/history endpoints require viewer or administrator access. Never put either key in source code or committed configuration.
+18. **Browser key handling:** The dashboard stores its supplied key only in tab-scoped `sessionStorage`. Static assets must never contain a configured key.
+19. **Network boundary:** Keep port 8000 private and terminate HTTPS/authentication controls at a reverse proxy for production access.
+20. **Production image integrity:** Do not add `.:/app` back to production Compose. Use `docker-compose.dev.yml` when source mounting is required for development.
 
 ---
 
@@ -675,12 +700,12 @@ Production dependencies are exact-pinned in `requirements.txt`:
 1. **Define SQL templates** in `sync_sql.py`:
    - Add a new function like `get_extension_sync_sql()` following the pattern of `get_sync_sql()`
    - Use OPENQUERY to pull from central, INSERT/UPDATE on the outlet
-   - Follow the conditional UPDATE + OUTPUT INTO pattern for change tracking
+   - If the source is queue-backed, keep delete markers separate and return explicit post-commit acknowledgement keys
 2. **Execute in the outlet flow** in `sync_engine.py:_run_on_outlet_blocking()`:
    - Execute as part of the existing batch and read additional marker result sets
-   - Or add a new result set marker alongside the existing `PRICE_CHANGES` marker
+   - Or add a new unambiguous summary/detail marker pair
 3. **Handle results**: The result dict returned by `_run_on_outlet_blocking()` can carry additional fields
-4. **Log to central DB**: Add a new function in `db_logger.py` following the `ProductPriceChangeLog` pattern
+4. **Post-commit effects**: Perform acknowledgements only after the outlet commit, with parameterized SQL and explicit partial-failure behavior
 
 ### Adding new API endpoints
 

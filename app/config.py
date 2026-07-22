@@ -9,6 +9,12 @@ class Settings(BaseSettings):
     SOURCE_USER: str
     SOURCE_PASSWORD: str
 
+    # Direct Head Office connection used only after an outlet transaction commits.
+    HO_SERVER: str
+    HO_DATABASE: str
+    HO_DB_USERNAME: str
+    HO_DB_PASSWORD: str
+
     # Log DB connection (secondary server — ProductSyncLog, ProductPriceChangeLog, and future log tables)
     LOG_SERVER: str
     LOG_DATABASE: str
@@ -59,6 +65,8 @@ class Settings(BaseSettings):
     # Price change log retention
     PRICE_CHANGE_RETENTION_DAYS: int = Field(default=90, ge=1, le=3650)
     PRICE_CHANGE_INSERT_BATCH_SIZE: int = Field(default=500, ge=1, le=2000)
+    ENABLE_PRODUCT_PRICE_CHANGE_LOG: bool = False
+    ENABLE_PRODUCT_SYNC_LOG_HISTORY: bool = False
 
     # Logging
     LOG_DIR: str = "logs"

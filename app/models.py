@@ -24,6 +24,8 @@ class SyncResult(BaseModel):
     captured_count: int = 0
     logged_count: int = 0
     audit_status: str = "NotApplicable"
+    ho_ack_status: str = "NotAttempted"
+    ho_ack_count: int = 0
 
 
 class SyncCycleStatus(BaseModel):

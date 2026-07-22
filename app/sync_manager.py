@@ -349,6 +349,8 @@ class SyncManager:
             "captured_count": 0,
             "logged_count": 0,
             "audit_status": "NotApplicable",
+            "ho_ack_status": "NotAttempted",
+            "ho_ack_count": 0,
         }
 
     @staticmethod
@@ -704,4 +706,6 @@ class SyncManager:
             "captured_count": 0,
             "logged_count": 0,
             "audit_status": "NotApplicable",
+            "ho_ack_status": "NotAttempted",
+            "ho_ack_count": 0,
         }

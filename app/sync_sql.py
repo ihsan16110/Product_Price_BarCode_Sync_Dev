@@ -1,164 +1,201 @@
+def _sql_identifier(value: str) -> str:
+    """Escape a SQL Server identifier that will be wrapped in square brackets."""
+    return str(value).replace("]", "]]")
+
+
+def _sql_literal(value: str) -> str:
+    """Escape a value embedded inside the quoted OPENQUERY statement."""
+    # The value is nested twice: once as a remote SQL literal and once inside
+    # OPENQUERY's local SQL string. Each input quote therefore becomes four.
+    return str(value).replace("'", "''''")
+
+
 def get_sync_sql(local_db: str, central_linked_server: str, central_db: str, outlet_code: str) -> str:
     """
-    Returns the sync SQL batch that runs on each outlet server.
-    Syncs Product, ProductPrice, and ProductBarcode from central Head Office to outlet.
-    The final result set contains price change data (marker 'PRICE_CHANGES') for audit logging.
+    Build the outlet-side synchronization batch.
+
+    Pending rows are read from the Head Office Rep* tables through the outlet's
+    linked server. The final marker result sets identify the exact ProductCode /
+    DepotCode pairs that Python may acknowledge on Head Office only after the
+    outlet transaction commits.
     """
+    local_db_id = _sql_identifier(local_db)
+    linked_server_id = _sql_identifier(central_linked_server)
+    central_db_id = _sql_identifier(central_db)
+    outlet_code_literal = _sql_literal(outlet_code)
+
     return f"""
 SET NOCOUNT ON;
-USE [{local_db}];
+USE [{local_db_id}];
 
--- ============================================================
--- PRODUCT: Load product data from central via linked server
--- ============================================================
-SELECT ProductCode, ProductName, BarCode, PackSize, SubCategoryID, BrandID, ManufacturerID, SubCategoryMD, CostPrice, UnitPrice, VATID, VATPerc, VAT, MRP, MinStock, MaxStock, MinOrderQty, Active, DiscountStatus, ExpiryManagement, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate, PosType, 'Y' AS AllowNegative
+-- Load product master data from Head Office.
+SELECT TOP 0
+    ProductCode, ProductName, BarCode, PackSize, SubCategoryID, BrandID,
+    ManufacturerID, SubCategoryMD, CostPrice, UnitPrice, VATID, VATPerc,
+    VAT, MRP, MinStock, MaxStock, MinOrderQty, Active, DiscountStatus,
+    ExpiryManagement, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate,
+    PosType, 'Y' AS AllowNegative
 INTO #HoProduct
-FROM OPENQUERY([{central_linked_server}], 'SELECT ProductCode, ProductName, BarCode, PackSize, SubCategoryID, BrandID, ManufacturerID, SubCategoryMD, CostPrice, UnitPrice, VATID, VATPerc, VAT, MRP, MinStock, MaxStock, MinOrderQty, Active, DiscountStatus, ExpiryManagement, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate, PosType FROM {central_db}.DBO.Product D');
+FROM Product;
 
--- ============================================================
--- PRODUCT PRICE: Load price data from central (filtered by date and depot)
--- ============================================================
-SELECT ProductCode, DepotCode, UnitPrice, VATPerc, VAT, MRP, ModifiedBy, ModifiedDate, VATDiscount, EffectedDate, VATDiscPerc, SDVATPerc, SDVATDiscPerc, VATCalcType
+INSERT INTO #HoProduct
+SELECT ProductCode, ProductName, BarCode, PackSize, SubCategoryID, BrandID,
+       ManufacturerID, SubCategoryMD, CostPrice, UnitPrice, VATID, VATPerc,
+       VAT, MRP, MinStock, MaxStock, MinOrderQty, Active, DiscountStatus,
+       ExpiryManagement, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate,
+       PosType, 'Y' AS AllowNegative
+FROM OPENQUERY([{linked_server_id}],
+    'SELECT ProductCode, ProductName, BarCode, PackSize, SubCategoryID, BrandID,
+            ManufacturerID, SubCategoryMD, CostPrice, UnitPrice, VATID, VATPerc,
+            VAT, MRP, MinStock, MaxStock, MinOrderQty, Active, DiscountStatus,
+            ExpiryManagement, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate,
+            PosType
+     FROM [{central_db_id}].dbo.RepProduct');
+
+-- Load pending non-delete price rows. Delete markers are deliberately excluded
+-- so a deleted outlet row cannot be inserted again later in this batch.
+SELECT TOP 0
+    ProductCode, DepotCode, UnitPrice, VATPerc, VAT, MRP, ModifiedBy,
+    ModifiedDate, VATDiscount, EffectedDate, VATDiscPerc, SDVATPerc,
+    SDVATDiscPerc, VATCalcType, CAST('N' AS VARCHAR(1)) AS Price
 INTO #HoProductPrice
-FROM OPENQUERY([{central_linked_server}], 'SELECT ProductCode, DepotCode, UnitPrice, VATPerc, VAT, MRP, ModifiedBy, ModifiedDate, VATDiscount, EffectedDate, VATDiscPerc, SDVATPerc, SDVATDiscPerc, VATCalcType FROM {central_db}.DBO.ProductPrice D WHERE (ModifiedDate >= LEFT(GETDATE()-1, 11) OR EffectedDate >= LEFT(GETDATE()-1, 11)) AND DepotCode = ''{outlet_code}''');
+FROM ProductPrice;
 
--- ============================================================
--- PRODUCT BARCODE: Load barcode data from central
--- ============================================================
-SELECT ProductCode, BarCode, CreatedBy, CreatedDate, Active
+INSERT INTO #HoProductPrice
+SELECT ProductCode, DepotCode, UnitPrice, VATPerc, VAT, MRP, ModifiedBy,
+       ModifiedDate, VATDiscount, EffectedDate, VATDiscPerc, SDVATPerc,
+       SDVATDiscPerc, VATCalcType, Price
+FROM OPENQUERY([{linked_server_id}],
+    'SELECT ProductCode, DepotCode, UnitPrice, VATPerc, VAT, MRP, ModifiedBy,
+            ModifiedDate, VATDiscount, EffectedDate, VATDiscPerc, SDVATPerc,
+            SDVATDiscPerc, VATCalcType, Price
+     FROM [{central_db_id}].dbo.RepProductPrice
+     WHERE SyncStatus = ''N''
+       AND ISNULL(SyncType, '''') <> ''D''
+       AND DepotCode = ''{outlet_code_literal}''');
+
+-- Load pending delete markers independently from the normal upsert rows.
+SELECT TOP 0 ProductCode, DepotCode
+INTO #HoProductPriceDelete
+FROM ProductPrice;
+
+INSERT INTO #HoProductPriceDelete
+SELECT ProductCode, DepotCode
+FROM OPENQUERY([{linked_server_id}],
+    'SELECT ProductCode, DepotCode
+     FROM [{central_db_id}].dbo.RepProductPrice
+     WHERE SyncStatus = ''N''
+       AND SyncType = ''D''
+       AND DepotCode = ''{outlet_code_literal}''');
+
+-- Load barcode data from Head Office.
+SELECT TOP 0 ProductCode, BarCode, CreatedBy, CreatedDate, Active
 INTO #HoBarcode
-FROM OPENQUERY([{central_linked_server}], 'SELECT ProductCode, BarCode, CreatedBy, CreatedDate, Active FROM {central_db}.DBO.ProductBarcode D');
+FROM ProductBarcode;
 
--- ============================================================
--- INSERT new products into outlet Product table
--- ============================================================
-INSERT INTO Product (ProductCode, ProductName, BarCode, PackSize, SubCategoryID, BrandID, ManufacturerID, SubCategoryMD, CostPrice, UnitPrice, VATID, VATPerc, VAT, MRP, MinStock, MaxStock, MinOrderQty, Active, DiscountStatus, ExpiryManagement, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate, PosType, AllowNegative)
-SELECT D.* FROM #HoProduct D
+INSERT INTO #HoBarcode
+SELECT ProductCode, BarCode, CreatedBy, CreatedDate, Active
+FROM OPENQUERY([{linked_server_id}],
+    'SELECT ProductCode, BarCode, CreatedBy, CreatedDate, Active
+     FROM [{central_db_id}].dbo.RepProductBarcode');
+
+-- Synchronize Product.
+INSERT INTO Product (
+    ProductCode, ProductName, BarCode, PackSize, SubCategoryID, BrandID,
+    ManufacturerID, SubCategoryMD, CostPrice, UnitPrice, VATID, VATPerc,
+    VAT, MRP, MinStock, MaxStock, MinOrderQty, Active, DiscountStatus,
+    ExpiryManagement, CreatedBy, CreatedDate, ModifiedBy, ModifiedDate,
+    PosType, AllowNegative
+)
+SELECT D.*
+FROM #HoProduct D
 LEFT JOIN Product P ON D.ProductCode = P.ProductCode
 WHERE P.ProductCode IS NULL;
 
--- ============================================================
--- UPDATE existing products in outlet Product table
--- ============================================================
 UPDATE P
 SET P.ProductName = D.ProductName,
-    P.UnitPrice   = D.UnitPrice,
-    P.Active      = D.Active,
-    P.VATPerc     = D.VATPerc,
-    P.VAT         = D.VAT
+    P.UnitPrice = D.UnitPrice,
+    P.Active = D.Active,
+    P.VATPerc = D.VATPerc,
+    P.VAT = D.VAT
 FROM Product P
 INNER JOIN #HoProduct D ON D.ProductCode = P.ProductCode;
 
--- ============================================================
--- PRICE CHANGE TRACKING: audit instrumentation only.
--- This declaration does not alter which ProductPrice rows are selected.
--- ============================================================
-DECLARE @PriceChanges TABLE (
-    ChangeType        VARCHAR(10),
-    ProductCode       VARCHAR(20),
-    DepotCode         VARCHAR(10),
-    OldUnitPrice      DECIMAL(18,4),
-    NewUnitPrice      DECIMAL(18,4),
-    OldModifiedDate   DATETIME,
-    NewModifiedDate   DATETIME,
-    ModifiedBy        VARCHAR(50)
-);
+-- Apply delete markers before normal price upserts.
+DELETE P
+FROM ProductPrice P
+INNER JOIN #HoProductPriceDelete D
+    ON D.ProductCode = P.ProductCode AND D.DepotCode = P.DepotCode;
 
--- ============================================================
--- INSERT new product prices into outlet ProductPrice table
--- ============================================================
-INSERT INTO ProductPrice (ProductCode, DepotCode, UnitPrice, VATPerc, VAT, MRP, ModifiedBy, ModifiedDate, VATDiscount, EffectedDate, VATDiscPerc, SDVATPerc, SDVATDiscPerc, VATCalcType)
-OUTPUT 'INSERT',
-       INSERTED.ProductCode,
-       INSERTED.DepotCode,
-       NULL,
-       INSERTED.UnitPrice,
-       NULL,
-       INSERTED.ModifiedDate,
-       INSERTED.ModifiedBy
-INTO @PriceChanges
-SELECT D.* FROM #HoProductPrice D
-LEFT JOIN ProductPrice P ON D.ProductCode = P.ProductCode AND D.DepotCode = P.DepotCode
+-- Insert missing ProductPrice rows. If Price is not Y, preserve the sample
+-- operation's fallback of zero because there is no existing outlet row.
+INSERT INTO ProductPrice (
+    ProductCode, DepotCode, UnitPrice, VATPerc, VAT, MRP, ModifiedBy,
+    ModifiedDate, VATDiscount, EffectedDate, VATDiscPerc, SDVATPerc,
+    SDVATDiscPerc, VATCalcType
+)
+SELECT D.ProductCode,
+       D.DepotCode,
+       CASE WHEN D.Price = 'Y' THEN D.UnitPrice ELSE ISNULL(P.UnitPrice, 0) END,
+       D.VATPerc,
+       D.VAT,
+       D.MRP,
+       D.ModifiedBy,
+       D.ModifiedDate,
+       D.VATDiscount,
+       D.EffectedDate,
+       D.VATDiscPerc,
+       D.SDVATPerc,
+       D.SDVATDiscPerc,
+       D.VATCalcType
+FROM #HoProductPrice D
+LEFT JOIN ProductPrice P
+    ON D.ProductCode = P.ProductCode AND D.DepotCode = P.DepotCode
 WHERE P.ProductCode IS NULL OR P.DepotCode IS NULL;
 
--- ============================================================
--- Identify only ProductPrice rows where UnitPrice or ModifiedDate changed
--- ============================================================
-SELECT D.ProductCode, D.DepotCode
-INTO #ChangedPrices
-FROM ProductPrice P
-INNER JOIN #HoProductPrice D ON D.ProductCode = P.ProductCode AND D.DepotCode = P.DepotCode
-LEFT JOIN (SELECT * FROM ProductVfmg WHERE Active = 'Y') SQ ON P.ProductCode = SQ.ProductCode
-WHERE SQ.ProductCode IS NULL
-  AND (
-      P.UnitPrice <> D.UnitPrice
-      OR (P.UnitPrice IS NULL AND D.UnitPrice IS NOT NULL)
-      OR (P.UnitPrice IS NOT NULL AND D.UnitPrice IS NULL)
-      OR P.ModifiedDate <> D.ModifiedDate
-      OR (P.ModifiedDate IS NULL AND D.ModifiedDate IS NOT NULL)
-      OR (P.ModifiedDate IS NOT NULL AND D.ModifiedDate IS NULL)
-  );
-
--- ============================================================
--- UPDATE only changed product prices, capturing before/after values
--- ============================================================
+-- For existing rows, Price controls only UnitPrice. Other supplied fields keep
+-- the behavior of the approved sample operation.
 UPDATE P
-SET P.UnitPrice    = D.UnitPrice,
-    P.VATPerc      = D.VATPerc,
-    P.VAT          = D.VAT,
-    P.ModifiedBy   = D.ModifiedBy,
+SET P.UnitPrice = CASE WHEN D.Price = 'Y' THEN D.UnitPrice ELSE P.UnitPrice END,
+    P.VATPerc = D.VATPerc,
+    P.VAT = D.VAT,
+    P.ModifiedBy = D.ModifiedBy,
     P.ModifiedDate = D.ModifiedDate,
     P.EffectedDate = D.EffectedDate,
-    P.VATDiscPerc  = D.VATDiscPerc,
-    P.VATCalcType  = D.VATCalcType
-OUTPUT 'UPDATE',
-       INSERTED.ProductCode,
-       INSERTED.DepotCode,
-       DELETED.UnitPrice,
-       INSERTED.UnitPrice,
-       DELETED.ModifiedDate,
-       INSERTED.ModifiedDate,
-       INSERTED.ModifiedBy
-INTO @PriceChanges
+    P.VATDiscPerc = D.VATDiscPerc,
+    P.VATCalcType = D.VATCalcType
 FROM ProductPrice P
-INNER JOIN #HoProductPrice D ON D.ProductCode = P.ProductCode AND D.DepotCode = P.DepotCode
-INNER JOIN #ChangedPrices C ON D.ProductCode = C.ProductCode AND D.DepotCode = C.DepotCode
-LEFT JOIN (SELECT * FROM ProductVfmg WHERE Active = 'Y') SQ ON P.ProductCode = SQ.ProductCode
-WHERE SQ.ProductCode IS NULL;
+INNER JOIN #HoProductPrice D
+    ON D.ProductCode = P.ProductCode AND D.DepotCode = P.DepotCode;
 
--- ============================================================
--- INSERT new barcodes into outlet ProductBarcode table
--- ============================================================
+-- Synchronize ProductBarcode.
 INSERT INTO ProductBarcode (ProductCode, BarCode, CreatedBy, CreatedDate, Active)
-SELECT D.* FROM #HoBarcode D
-LEFT JOIN ProductBarcode P ON D.ProductCode = P.ProductCode AND D.BarCode = P.BarCode
+SELECT D.ProductCode, D.BarCode, D.CreatedBy, D.CreatedDate, D.Active
+FROM #HoBarcode D
+LEFT JOIN ProductBarcode P
+    ON D.ProductCode = P.ProductCode AND D.BarCode = P.BarCode
 WHERE P.ProductCode IS NULL OR P.BarCode IS NULL;
 
--- ============================================================
--- RETURN price change data for audit logging (read by Python via pyodbc)
--- ============================================================
-SELECT 'PRICE_CHANGE_SUMMARY' AS Marker,
-       COUNT(*) AS CapturedCount
-FROM @PriceChanges;
+-- Return both upserted and deleted keys for the separate post-commit HO update.
+SELECT A.ProductCode, A.DepotCode
+INTO #HoAcknowledgements
+FROM (
+    SELECT ProductCode, DepotCode FROM #HoProductPrice
+    UNION
+    SELECT ProductCode, DepotCode FROM #HoProductPriceDelete
+) A;
 
-SELECT 'PRICE_CHANGES' AS Marker,
-       ChangeType,
-       ProductCode,
-       DepotCode,
-       OldUnitPrice,
-       NewUnitPrice,
-       OldModifiedDate,
-       NewModifiedDate,
-       ModifiedBy
-FROM @PriceChanges;
+SELECT 'HO_ACK_SUMMARY' AS Marker, COUNT(*) AS AcknowledgementCount
+FROM #HoAcknowledgements;
 
--- ============================================================
--- CLEANUP: Drop temp tables
--- ============================================================
+SELECT 'HO_ACKNOWLEDGEMENTS' AS Marker, ProductCode, DepotCode
+FROM #HoAcknowledgements;
+
+DROP TABLE #HoAcknowledgements;
+DROP TABLE #HoProductPriceDelete;
 DROP TABLE #HoProduct;
 DROP TABLE #HoProductPrice;
 DROP TABLE #HoBarcode;
-DROP TABLE #ChangedPrices;
 """
 
 

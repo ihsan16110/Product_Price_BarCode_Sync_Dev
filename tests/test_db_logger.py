@@ -86,6 +86,7 @@ class TestInsertPriceChanges:
         assert result == 0
 
     @patch("app.db_logger.make_connection")
+    @patch("app.db_logger.settings.ENABLE_PRODUCT_PRICE_CHANGE_LOG", True)
     def test_single_change(self, mock_make_connection):
         """A single price change should be inserted correctly."""
         mock_conn = MagicMock()
@@ -264,6 +265,7 @@ class TestInsertPriceChanges:
 
     @pytest.mark.asyncio
     @patch("app.db_logger.asyncio.to_thread")
+    @patch("app.db_logger.settings.ENABLE_PRODUCT_PRICE_CHANGE_LOG", True)
     async def test_async_wrapper_delegates(self, mock_to_thread):
         """The async wrapper should delegate to the blocking function."""
         mock_to_thread.return_value = 3
@@ -434,6 +436,8 @@ class TestEnsurePriceChangeTable:
 def test_audit_schema_cache_runs_all_ddl_once():
     mock_cursor = MagicMock()
     with (
+        patch("app.db_logger.settings.ENABLE_PRODUCT_PRICE_CHANGE_LOG", True),
+        patch("app.db_logger.settings.ENABLE_PRODUCT_SYNC_LOG_HISTORY", True),
         patch("app.db_logger._ensure_sync_log_table") as ensure_summary,
         patch("app.db_logger._ensure_price_change_table") as ensure_prices,
         patch("app.db_logger._ensure_sync_history_table") as ensure_history,

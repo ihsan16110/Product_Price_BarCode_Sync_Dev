@@ -1,9 +1,12 @@
-from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from app.sync_engine import _extract_price_changes, run_on_outlet
+from app.sync_engine import (
+    _acknowledge_ho_blocking,
+    _extract_ho_acknowledgements,
+    run_on_outlet,
+)
 
 
 class ResultSetCursor:
@@ -24,92 +27,122 @@ class ResultSetCursor:
         return True
 
 
-def test_extracts_insert_and_update_events_across_result_sets():
-    now = datetime(2026, 7, 18, 10, 30)
+def test_extracts_ho_acknowledgements_across_result_sets():
     cursor = ResultSetCursor([
-        [("PRICE_CHANGE_SUMMARY", 2)],
+        [("HO_ACK_SUMMARY", 2)],
         [
-            ("PRICE_CHANGES", "INSERT", "P001", "B004", None, 10, None, now, "admin"),
-            ("PRICE_CHANGES", "UPDATE", "P002", "B004", 20, 25, now, now, "admin"),
+            ("HO_ACKNOWLEDGEMENTS", "P001", "B004"),
+            ("HO_ACKNOWLEDGEMENTS", "P002", "B004"),
         ],
     ])
 
-    changes, captured = _extract_price_changes(cursor)
+    acknowledgements, expected = _extract_ho_acknowledgements(cursor)
 
-    assert captured == 2
-    assert [change["change_type"] for change in changes] == ["INSERT", "UPDATE"]
-    assert changes[0]["old_unit_price"] is None
-    assert changes[1]["old_unit_price"] == 20.0
-    assert changes[0]["new_modified_date"] is now
-    assert changes[1]["old_modified_date"] is now
-    assert changes[1]["new_modified_date"] is now
-    assert all(change["event_id"] for change in changes)
+    assert expected == 2
+    assert acknowledgements == [("P001", "B004"), ("P002", "B004")]
 
 
-def test_zero_change_summary_is_explicit_and_valid():
-    changes, captured = _extract_price_changes(ResultSetCursor([
-        [("PRICE_CHANGE_SUMMARY", 0)],
+def test_zero_acknowledgement_summary_is_explicit_and_valid():
+    acknowledgements, expected = _extract_ho_acknowledgements(ResultSetCursor([
+        [("HO_ACK_SUMMARY", 0)],
         [],
     ]))
-    assert captured == 0
-    assert changes == []
+    assert expected == 0
+    assert acknowledgements == []
 
 
-def test_missing_summary_is_rejected():
+def test_missing_acknowledgement_summary_is_rejected():
     with pytest.raises(RuntimeError, match="summary result set"):
-        _extract_price_changes(ResultSetCursor([[]]))
+        _extract_ho_acknowledgements(ResultSetCursor([[]]))
 
 
-def test_count_mismatch_is_rejected():
+def test_acknowledgement_count_mismatch_is_rejected():
     with pytest.raises(RuntimeError, match="count mismatch"):
-        _extract_price_changes(ResultSetCursor([
-            [("PRICE_CHANGE_SUMMARY", 1)],
+        _extract_ho_acknowledgements(ResultSetCursor([
+            [("HO_ACK_SUMMARY", 1)],
             [],
         ]))
 
 
+def test_empty_acknowledgement_key_is_rejected():
+    with pytest.raises(RuntimeError, match="empty key"):
+        _extract_ho_acknowledgements(ResultSetCursor([
+            [("HO_ACK_SUMMARY", 1)],
+            [("HO_ACKNOWLEDGEMENTS", "", "B004")],
+        ]))
+
+
+def test_ho_acknowledgement_is_parameterized_and_committed():
+    connection = MagicMock()
+    cursor = connection.cursor.return_value
+    with patch("app.sync_engine.make_connection", return_value=connection) as connect:
+        count = _acknowledge_ho_blocking([
+            ("P001", "B004"),
+            ("P001", "B004"),
+            ("P002", "B004"),
+        ])
+
+    assert count == 2
+    connect.assert_called_once_with(
+        server="test-ho-server",
+        database="TestHODB",
+        user="test_ho_user",
+        password="test_ho_pass",
+        autocommit=False,
+    )
+    sql, params = cursor.executemany.call_args.args
+    assert "SET SyncStatus = 'Y', SentTime = GETDATE()" in sql
+    assert "ProductCode = ?" in sql
+    assert "DepotCode = ?" in sql
+    assert params == [("P001", "B004"), ("P002", "B004")]
+    connection.commit.assert_called_once_with()
+    connection.close.assert_called_once_with()
+
+
 @pytest.mark.asyncio
-async def test_end_to_end_audit_success_updates_counts_and_history():
+async def test_post_commit_ho_acknowledgement_success():
     result = {
         "outlet_code": "B004", "ip": "10.0.0.4", "status": "Success",
         "remarks": "Y", "timestamp": "2026-07-18T10:30:00",
         "duration_seconds": 1.2, "run_id": "11111111-1111-1111-1111-111111111111",
-        "trigger": "single", "captured_count": 1, "logged_count": 0,
-        "audit_status": "Pending", "price_changes": [{"event_id": "evt", "change_type": "INSERT"}],
+        "trigger": "single", "captured_count": 0, "logged_count": 0,
+        "audit_status": "Disabled", "ho_ack_status": "Pending", "ho_ack_count": 0,
+        "ho_acknowledgements": [("P001", "B004")],
     }
     with (
-        patch("app.sync_engine.asyncio.to_thread", AsyncMock(return_value=result)),
-        patch("app.sync_engine.log_product_price_changes", AsyncMock(return_value=1)) as log_changes,
+        patch("app.sync_engine.asyncio.to_thread", AsyncMock(side_effect=[result, 1])),
         patch("app.sync_engine.update_product_sync_log", AsyncMock(return_value=True)),
-        patch("app.sync_engine.log_sync_history", AsyncMock(return_value=True)) as history,
+        patch("app.sync_engine.log_sync_history", AsyncMock()) as history,
     ):
         actual = await run_on_outlet({"Outlet": "B004"})
 
     assert actual["status"] == "Success"
-    assert actual["audit_status"] == "Logged"
-    assert actual["logged_count"] == 1
-    log_changes.assert_awaited_once()
-    history.assert_awaited_once_with(actual)
+    assert actual["ho_ack_status"] == "Acknowledged"
+    assert actual["ho_ack_count"] == 1
+    assert "ho_acknowledgements" not in actual
+    history.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_audit_failure_becomes_partial():
+async def test_ho_acknowledgement_failure_becomes_partial():
     result = {
         "outlet_code": "B004", "ip": "10.0.0.4", "status": "Success",
         "remarks": "Y", "timestamp": "2026-07-18T10:30:00",
         "duration_seconds": 1.2, "run_id": "11111111-1111-1111-1111-111111111111",
-        "trigger": "single", "captured_count": 1, "logged_count": 0,
-        "audit_status": "Pending", "price_changes": [{"event_id": "evt", "change_type": "UPDATE"}],
+        "trigger": "single", "captured_count": 0, "logged_count": 0,
+        "audit_status": "Disabled", "ho_ack_status": "Pending", "ho_ack_count": 0,
+        "ho_acknowledgements": [("P001", "B004")],
     }
     with (
-        patch("app.sync_engine.asyncio.to_thread", AsyncMock(return_value=result)),
-        patch("app.sync_engine.log_product_price_changes", AsyncMock(side_effect=Exception("log offline"))),
+        patch(
+            "app.sync_engine.asyncio.to_thread",
+            AsyncMock(side_effect=[result, Exception("HO offline")]),
+        ),
         patch("app.sync_engine.update_product_sync_log", AsyncMock(return_value=True)),
-        patch("app.sync_engine.log_sync_history", AsyncMock(return_value=True)),
     ):
         actual = await run_on_outlet({"Outlet": "B004"})
 
     assert actual["status"] == "Partial"
-    assert actual["audit_status"] == "AuditFailed"
-    assert actual["logged_count"] == 0
-    assert "log offline" in actual["remarks"]
+    assert actual["ho_ack_status"] == "Failed"
+    assert actual["ho_ack_count"] == 0
+    assert "HO offline" in actual["remarks"]

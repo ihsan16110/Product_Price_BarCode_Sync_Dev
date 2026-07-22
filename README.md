@@ -1,6 +1,6 @@
 # ProductPriceSync Service
 
-Synchronizes Product, ProductPrice, and BarCode data from the head-office SQL Server to outlet databases, with scheduling, retries, price-change auditing, cleanup, and an operational dashboard.
+Synchronizes queued Product, ProductPrice, and BarCode data from the Head Office SQL Server to outlet databases, with scheduling, retries, post-commit Head Office acknowledgements, and an operational dashboard.
 
 ## Production setup
 
@@ -37,8 +37,8 @@ npm test -- --runInBand
 ## Concurrency capacity
 
 The production target is 20 concurrent outlets with 40 explicitly configured
-ODBC worker threads. Price-audit writes are sent in batches of 500 and logging
-schema DDL is cached after startup. Follow the staged monitoring and rollback
+ODBC worker threads. Outlet changes commit before the service marks the exact
+`RepProductPrice` keys as sent at Head Office. Follow the staged monitoring and rollback
 gates in [the concurrency-20 rollout plan](docs/CONCURRENCY_20_ROLLOUT_PLAN.md)
 before enabling 20 in production.
 
@@ -48,7 +48,7 @@ and the [DBA-managed schema script](docs/PRODUCT_SYNC_STATE_SCHEMA.sql).
 
 ## Dashboard and authentication
 
-Open `http://<server>:8000/ProductSync/Dashboard`. Enter `ADMIN_API_KEY` in the dashboard to use administrative controls, protected logs, and price history. The key is kept only in the current browser tab's session storage; it is not embedded in the application.
+Open `http://<server>:8000/ProductSync/Dashboard`. Enter `ADMIN_API_KEY` in the dashboard to use administrative controls and protected logs. The key is kept only in the current browser tab's session storage; it is not embedded in the application. Legacy price-change history is available only when `ENABLE_PRODUCT_PRICE_CHANGE_LOG=true`.
 
 For direct API requests, send:
 
