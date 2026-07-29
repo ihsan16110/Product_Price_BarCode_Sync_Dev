@@ -116,6 +116,8 @@ class TestSyncManagerInitialState:
         assert manager.completed_count == 867
         assert manager.failed_count == 96
         assert manager.retry_queue.size == 1
+        assert manager.retry_queue.pending_count == 1
+        assert manager.retry_queue.get_all()[0]["max_attempts"] == 10
 
 
 class TestSyncManagerResults:

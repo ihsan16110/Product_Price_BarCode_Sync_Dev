@@ -46,7 +46,6 @@ class RetryEntry:
             "Password": settings.OUTLET_DB_PASSWORD,
         }
         entry = cls(outlet, data.get("last_error", ""), int(data["attempt"]))
-        entry.max_attempts = int(data.get("max_attempts", settings.RETRY_MAX_ATTEMPTS))
         entry.added_at = datetime.fromisoformat(data["added_at"])
         entry.next_retry_at = datetime.fromisoformat(data["next_retry_at"])
         return entry
@@ -116,7 +115,14 @@ class RetryQueue:
         self._permanently_failed.clear()
         for data in entries:
             entry = RetryEntry.from_persisted(data)
-            target = self._permanently_failed if data.get("permanently_failed") else self._queue
+            # Re-evaluate persisted entries against the current policy. This
+            # revives entries exhausted under an older, lower retry limit and
+            # also handles a limit that has subsequently been reduced.
+            target = (
+                self._permanently_failed
+                if entry.attempt >= settings.RETRY_MAX_ATTEMPTS
+                else self._queue
+            )
             target[entry.outlet_code] = entry
         logger.info(f"Restored {len(entries)} retry entries from the log database")
 

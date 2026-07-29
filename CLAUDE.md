@@ -85,7 +85,7 @@ Uses `pydantic-settings` BaseSettings loaded from `.env` file. All settings are 
 | Watchdogs | `OUTLET_SYNC_TIMEOUT` (180s), `FULL_SYNC_TIMEOUT` (10800s) | asyncio per-outlet and per-cycle timeouts |
 | Exclusions | `EXCLUDED_OUTLETS` (default empty) | Comma-separated, case-insensitive |
 | Scheduling | `SYNC_INTERVAL_MINUTES` (30) | Default interval |
-| Retry | `RETRY_MAX_ATTEMPTS` (3), `RETRY_BASE_DELAY` (30s) | Retry policy |
+| Retry | `RETRY_MAX_ATTEMPTS` (10), `RETRY_BASE_DELAY` (30s) | Retry policy |
 | Concurrency | `MAX_CONCURRENT_SYNCS` (20), `THREAD_POOL_MAX_WORKERS` (40) | Max simultaneous outlet syncs and explicit blocking-ODBC worker capacity |
 | Security | `ADMIN_API_KEY`, `VIEWER_API_KEY`, `ADMIN_RATE_LIMIT_PER_MINUTE` | Operator/viewer authorization and administrative request limiting |
 | Legacy audit flags | `ENABLE_PRODUCT_PRICE_CHANGE_LOG=false`, `ENABLE_PRODUCT_SYNC_LOG_HISTORY=false` | Dormant audit tables; keep disabled unless deliberately reactivating and validating the old subsystem |
@@ -404,7 +404,7 @@ OUTLET sync SQL executes in one transaction
 
 ### Retry Queue Behavior
 - Exponential backoff: `RETRY_BASE_DELAY * 2^(attempt-1) + random(0, 5)`
-- Max attempts: `RETRY_MAX_ATTEMPTS` (default 3)
+- Max attempts: `RETRY_MAX_ATTEMPTS` (default 10)
 - Permanently failed when: `attempt >= RETRY_MAX_ATTEMPTS` (off-by-one correction: previously was `>`)
 - Deduplication: Only one entry per outlet code at a time
 - Persisted in `dbo.ProductSyncRetryQueue` and restored at service startup. Database passwords are reconstructed from settings and are never stored in this table.

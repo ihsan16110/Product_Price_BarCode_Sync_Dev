@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     SYNC_INTERVAL_MINUTES: int = Field(default=30, ge=1)
 
     # Retry settings
-    RETRY_MAX_ATTEMPTS: int = Field(default=3, ge=1, le=20)
+    RETRY_MAX_ATTEMPTS: int = Field(default=10, ge=1, le=20)
     RETRY_BASE_DELAY: int = Field(default=30, ge=1)  # seconds
 
     # API server

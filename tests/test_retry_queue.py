@@ -40,7 +40,7 @@ class TestRetryEntry:
         assert entry.outlet_code == "B001"
         assert entry.server == "192.168.1.1"
         assert entry.attempt == 1
-        assert entry.max_attempts == 3  # from default settings
+        assert entry.max_attempts == 10  # from default settings
         assert "Connection error" in entry.last_error
         assert entry.next_retry_at > datetime.now()
 
@@ -74,7 +74,7 @@ class TestRetryEntry:
         assert d["outlet_code"] == "B005"
         assert d["server"] == "10.0.0.5"
         assert d["attempt"] == 2
-        assert d["max_attempts"] == 3
+        assert d["max_attempts"] == 10
         assert "next_retry_at" in d
         assert d["last_error"] == "Login failed"
         assert "added_at" in d
@@ -90,6 +90,7 @@ class TestRetryEntry:
         })
         assert entry.outlet_code == "B005"
         assert entry.attempt == 2
+        assert entry.max_attempts == 10
         assert entry.added_at == now
 
 
@@ -176,7 +177,7 @@ class TestRetryQueue:
 
         # Add with attempt already at max -> permanently failed
         outlet = make_outlet("B001")
-        q.add(outlet, "Fatal error", attempt=3)
+        q.add(outlet, "Fatal error", attempt=10)
 
         entries = q.get_all()
         assert len(entries) == 1
@@ -204,7 +205,7 @@ class TestRetryQueue:
         outlet = make_outlet("B045")
 
         # Add at max attempts -> should go directly to permanently failed
-        q.add(outlet, "Persistent error", attempt=3)
+        q.add(outlet, "Persistent error", attempt=10)
 
         assert q.pending_count == 0
         assert q.size == 1
@@ -215,7 +216,7 @@ class TestRetryQueue:
     def test_remove_cleans_permanently_failed(self):
         """Removing a permanently failed outlet should also clear it."""
         q = RetryQueue()
-        q.add(make_outlet("B001"), "Error", attempt=3)
+        q.add(make_outlet("B001"), "Error", attempt=10)
         assert q.size == 1
 
         q.remove("B001")
@@ -225,7 +226,7 @@ class TestRetryQueue:
         """Clearing should empty both pending and permanently failed."""
         q = RetryQueue()
         q.add(make_outlet("B001"), "Regular", attempt=1)
-        q.add(make_outlet("B002"), "Permanent", attempt=3)
+        q.add(make_outlet("B002"), "Permanent", attempt=10)
         assert q.size == 2
 
         q.clear()
@@ -240,7 +241,7 @@ class TestRetryQueue:
         q.add(make_outlet("B001"), "Attempt 1 fail", attempt=1)
         entries = q.get_all()
         assert entries[0]["attempt"] == 1
-        assert entries[0]["max_attempts"] == 3
+        assert entries[0]["max_attempts"] == 10
 
         # Remove and re-add at higher attempt
         q.remove("B001")
@@ -266,14 +267,26 @@ class TestRetryQueue:
 
     def test_restore_replaces_pending_and_permanent_entries(self):
         now = datetime.now()
-        rows = []
-        for code, permanent in [("B001", False), ("B002", True)]:
-            rows.append({
-                "outlet_code": code, "server": "10.0.0.1", "attempt": 3 if permanent else 1,
-                "max_attempts": 3, "last_error": "error", "added_at": now.isoformat(),
-                "next_retry_at": now.isoformat(), "permanently_failed": permanent,
-            })
+        rows = [{
+            "outlet_code": "B001", "server": "10.0.0.1", "attempt": 1,
+            "max_attempts": 3, "last_error": "error", "added_at": now.isoformat(),
+            "next_retry_at": now.isoformat(), "permanently_failed": False,
+        }, {
+            # This entry was exhausted under the old 3-attempt policy.
+            "outlet_code": "B002", "server": "10.0.0.2", "attempt": 3,
+            "max_attempts": 3, "last_error": "error", "added_at": now.isoformat(),
+            "next_retry_at": now.isoformat(), "permanently_failed": True,
+        }, {
+            # Classification is always based on the current policy.
+            "outlet_code": "B003", "server": "10.0.0.3", "attempt": 10,
+            "max_attempts": 20, "last_error": "error", "added_at": now.isoformat(),
+            "next_retry_at": now.isoformat(), "permanently_failed": False,
+        }]
         q = RetryQueue()
         q.restore(rows)
-        assert q.size == 2
-        assert q.pending_count == 1
+        assert q.size == 3
+        assert q.pending_count == 2
+        restored = {entry["outlet_code"]: entry for entry in q.get_all()}
+        assert restored["B002"]["max_attempts"] == 10
+        assert "permanently_failed" not in restored["B002"]
+        assert restored["B003"]["permanently_failed"] is True
